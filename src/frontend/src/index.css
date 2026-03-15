@@ -1,0 +1,151 @@
+@font-face {
+  font-family: "Bricolage Grotesque";
+  src: url("/assets/fonts/BricolageGrotesque.woff2") format("woff2");
+  font-weight: 200 800;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Figtree";
+  src: url("/assets/fonts/Figtree.woff2") format("woff2");
+  font-weight: 300 900;
+  font-display: swap;
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0.12 0.01 250;
+    --foreground: 0.97 0.005 250;
+    --card: 0.16 0.015 250;
+    --card-foreground: 0.97 0.005 250;
+    --popover: 0.16 0.015 250;
+    --popover-foreground: 0.97 0.005 250;
+    --primary: 0.72 0.22 145;
+    --primary-foreground: 0.08 0.01 145;
+    --secondary: 0.22 0.02 250;
+    --secondary-foreground: 0.9 0.01 250;
+    --muted: 0.22 0.02 250;
+    --muted-foreground: 0.6 0.02 250;
+    --accent: 0.8 0.25 60;
+    --accent-foreground: 0.08 0.01 60;
+    --destructive: 0.65 0.25 25;
+    --destructive-foreground: 0.97 0.005 25;
+    --border: 0.28 0.03 250;
+    --input: 0.28 0.03 250;
+    --ring: 0.72 0.22 145;
+    --radius: 0.75rem;
+    --chart-1: 0.72 0.22 145;
+    --chart-2: 0.75 0.2 60;
+    --chart-3: 0.65 0.25 25;
+    --chart-4: 0.7 0.2 200;
+    --chart-5: 0.8 0.18 310;
+    --sidebar: 0.14 0.015 250;
+    --sidebar-foreground: 0.9 0.01 250;
+    --sidebar-primary: 0.72 0.22 145;
+    --sidebar-primary-foreground: 0.08 0.01 145;
+    --sidebar-accent: 0.22 0.02 250;
+    --sidebar-accent-foreground: 0.9 0.01 250;
+    --sidebar-border: 0.28 0.03 250;
+    --sidebar-ring: 0.72 0.22 145;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: "Figtree", sans-serif;
+  }
+}
+
+.font-display {
+  font-family: "Bricolage Grotesque", sans-serif;
+}
+
+/* Neon glow effects */
+.neon-green {
+  text-shadow: 0 0 10px rgba(100, 255, 150, 0.8), 0 0 30px
+    rgba(100, 255, 150, 0.4);
+}
+.neon-yellow {
+  text-shadow: 0 0 10px rgba(255, 230, 50, 0.8), 0 0 30px
+    rgba(255, 230, 50, 0.4);
+}
+.neon-blue {
+  text-shadow: 0 0 10px rgba(100, 160, 255, 0.8), 0 0 30px
+    rgba(100, 160, 255, 0.4);
+}
+.neon-red {
+  text-shadow: 0 0 10px rgba(255, 100, 100, 0.8), 0 0 30px
+    rgba(255, 100, 100, 0.4);
+}
+
+.btn-neon {
+  position: relative;
+  overflow: hidden;
+  transition: all 0.2s ease;
+}
+.btn-neon::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.1) 0%,
+    transparent 60%
+  );
+  pointer-events: none;
+}
+.btn-neon:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(100, 255, 150, 0.3);
+}
+.btn-neon:active {
+  transform: translateY(0);
+}
+
+.scanlines {
+  position: fixed;
+  inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+  pointer-events: none;
+  z-index: 100;
+}
+
+@keyframes pulse-border {
+  0%,
+  100% {
+    border-color: rgba(100, 255, 150, 0.5);
+  }
+  50% {
+    border-color: rgba(100, 255, 150, 1);
+  }
+}
+
+@keyframes score-pop {
+  0% {
+    transform: scale(1);
+  }
+  50% {
+    transform: scale(1.4);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.score-pop {
+  animation: score-pop 0.4s ease;
+}

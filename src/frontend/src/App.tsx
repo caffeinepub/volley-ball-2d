@@ -1,0 +1,1624 @@
+import type React from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { backendInterface } from "./backend";
+import { createActorWithConfig } from "./config";
+
+// ─── Types ───────────────────────────────────────────────────────────────────
+type Screen =
+  | "platform"
+  | "menu"
+  | "difficulty"
+  | "online"
+  | "game"
+  | "gameover";
+type GameMode = "friend" | "ai" | "online-host" | "online-guest";
+type Difficulty = "easy" | "medium" | "hard";
+type Platform = "pc" | "mobile";
+
+interface Vec2 {
+  x: number;
+  y: number;
+}
+interface Player {
+  pos: Vec2;
+  vel: Vec2;
+  onGround: boolean;
+  facingRight: boolean;
+  hitFlash: number;
+}
+interface Ball {
+  pos: Vec2;
+  vel: Vec2;
+  radius: number;
+  spin: number;
+  angle: number;
+}
+interface GameState {
+  p1: Player;
+  p2: Player;
+  ball: Ball;
+  score: [number, number];
+  serving: 1 | 2;
+  serveTimer: number;
+  celebrating: number;
+  celebratingPlayer: 0 | 1 | 2;
+}
+interface HitCooldowns {
+  p1: number;
+  p2: number;
+}
+interface OnlineInput {
+  left: boolean;
+  right: boolean;
+  jump: boolean;
+  hit: boolean;
+}
+
+// ─── Constants ───────────────────────────────────────────────────────────────
+const WIN_SCORE = 7;
+const GRAVITY = 0.55;
+const PLAYER_SPEED = 5.5;
+const JUMP_FORCE = -13;
+const BALL_RADIUS = 18;
+const PLAYER_RADIUS = 28;
+const NET_WIDTH = 14;
+const SERVE_DELAY = 90;
+const MAX_BALL_SPEED = 16;
+const HIT_COOLDOWN_FRAMES = 20;
+const HIT_RANGE_EXTRA = 12; // extra pixels beyond contact distance
+const CW = 900;
+const CH = 500;
+const GROUND_Y = CH - 60;
+const NET_X = CW / 2;
+const NET_H = 130;
+
+// AI settings per difficulty
+const AI_CONFIG = {
+  easy: {
+    speedMult: 0.45,
+    reactionRange: 300,
+    missFactor: 0.3,
+    autoHitRange: 60,
+  },
+  medium: {
+    speedMult: 0.75,
+    reactionRange: 500,
+    missFactor: 0.1,
+    autoHitRange: 50,
+  },
+  hard: {
+    speedMult: 0.98,
+    reactionRange: 900,
+    missFactor: 0.0,
+    autoHitRange: 45,
+  },
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function clamp(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, v));
+}
+function dist(a: Vec2, b: Vec2) {
+  return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
+}
+function capSpeed(vel: Vec2, maxSpeed: number) {
+  const speed = Math.sqrt(vel.x ** 2 + vel.y ** 2);
+  if (speed > maxSpeed) {
+    vel.x = (vel.x / speed) * maxSpeed;
+    vel.y = (vel.y / speed) * maxSpeed;
+  }
+}
+function makePlayer(x: number): Player {
+  return {
+    pos: { x, y: GROUND_Y - PLAYER_RADIUS },
+    vel: { x: 0, y: 0 },
+    onGround: true,
+    facingRight: x < CW / 2,
+    hitFlash: 0,
+  };
+}
+function makeBall(serving: 1 | 2): Ball {
+  const side = serving === 1 ? 1 : -1;
+  return {
+    pos: { x: CW / 2 + side * 180, y: GROUND_Y - 140 },
+    vel: { x: side * 0.5, y: -2 },
+    radius: BALL_RADIUS,
+    spin: 0,
+    angle: 0,
+  };
+}
+function makeGameState(): GameState {
+  return {
+    p1: makePlayer(CW * 0.25),
+    p2: makePlayer(CW * 0.75),
+    ball: makeBall(1),
+    score: [0, 0],
+    serving: 1,
+    serveTimer: SERVE_DELAY,
+    celebrating: 0,
+    celebratingPlayer: 0,
+  };
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+export default function App() {
+  const [screen, setScreen] = useState<Screen>("platform");
+  const [mode, setMode] = useState<GameMode>("ai");
+  const [difficulty, setDifficulty] = useState<Difficulty>("medium");
+  const [platform, setPlatform] = useState<Platform>("pc");
+  const [score, setScore] = useState<[number, number]>([0, 0]);
+  const [winner, setWinner] = useState<1 | 2>(1);
+  const actorRef = useRef<backendInterface | null>(null);
+
+  useEffect(() => {
+    createActorWithConfig()
+      .then((a) => {
+        actorRef.current = a;
+      })
+      .catch(() => {});
+  }, []);
+  const [roomCode, setRoomCode] = useState("");
+  const [joinCodeInput, setJoinCodeInput] = useState("");
+  const [onlineStatus, setOnlineStatus] = useState("");
+  const [onlineWaiting, setOnlineWaiting] = useState(false);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const gsRef = useRef<GameState>(makeGameState());
+  const keysRef = useRef<Set<string>>(new Set());
+  const rafRef = useRef<number>(0);
+  const modeRef = useRef<GameMode>("ai");
+  const screenRef = useRef<Screen>("platform");
+  const difficultyRef = useRef<Difficulty>("medium");
+  const hitCooldownRef = useRef<HitCooldowns>({ p1: 0, p2: 0 });
+  const onlineCodeRef = useRef("");
+  const guestInputRef = useRef<OnlineInput>({
+    left: false,
+    right: false,
+    jump: false,
+    hit: false,
+  });
+  const sendStateTimerRef = useRef(0);
+  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Mobile joystick state
+  const [mobileHitPressed, setMobileHitPressed] = useState(false);
+  const joystickRef = useRef({
+    active: false,
+    originX: 0,
+    originY: 0,
+    dx: 0,
+    dy: 0,
+  });
+  const mobileInputRef = useRef({
+    left: false,
+    right: false,
+    jump: false,
+    hit: false,
+  });
+
+  // Sync refs
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    screenRef.current = screen;
+  }, [screen]);
+  useEffect(() => {
+    difficultyRef.current = difficulty;
+  }, [difficulty]);
+
+  // Mobile input sync
+  useEffect(() => {
+    const joy = joystickRef.current;
+    const inp = mobileInputRef.current;
+    inp.left = joy.dx < -20;
+    inp.right = joy.dx > 20;
+    inp.jump = joy.dy < -40;
+    inp.hit = mobileHitPressed;
+  }, [mobileHitPressed]);
+
+  const startGame = useCallback((m: GameMode, diff?: Difficulty) => {
+    setMode(m);
+    modeRef.current = m;
+    if (diff) {
+      setDifficulty(diff);
+      difficultyRef.current = diff;
+    }
+    gsRef.current = makeGameState();
+    hitCooldownRef.current = { p1: 0, p2: 0 };
+    setScore([0, 0]);
+    setScreen("game");
+    screenRef.current = "game";
+  }, []);
+
+  // ─── Keyboard Input ──────────────────────────────────────────────────────
+  useEffect(() => {
+    const PREVENT = new Set([
+      "ArrowUp",
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      " ",
+      "w",
+      "a",
+      "s",
+      "d",
+      "W",
+      "A",
+      "S",
+      "D",
+      "Enter",
+    ]);
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (PREVENT.has(e.key)) e.preventDefault();
+      keysRef.current.add(e.key);
+    };
+    const onKeyUp = (e: KeyboardEvent) => keysRef.current.delete(e.key);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
+  }, []);
+
+  // ─── Online Polling ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (screen !== "game") return;
+    const m = modeRef.current;
+
+    if (m === "online-host") {
+      // Poll guest input
+      const iv = setInterval(async () => {
+        try {
+          const raw = await actorRef.current!.getInput(onlineCodeRef.current);
+          if (raw) {
+            const inp = JSON.parse(raw) as OnlineInput;
+            guestInputRef.current = inp;
+          }
+        } catch {
+          /* ignore */
+        }
+      }, 100);
+      pollIntervalRef.current = iv;
+      return () => clearInterval(iv);
+    }
+
+    if (m === "online-guest") {
+      // Poll host state
+      const iv = setInterval(async () => {
+        try {
+          const raw = await actorRef.current!.getState(onlineCodeRef.current);
+          if (raw) {
+            const parsed = JSON.parse(raw) as GameState;
+            gsRef.current = parsed;
+            setScore([...parsed.score] as [number, number]);
+            if (parsed.score[0] >= WIN_SCORE || parsed.score[1] >= WIN_SCORE) {
+              setWinner(parsed.score[0] >= WIN_SCORE ? 1 : 2);
+              setScreen("gameover");
+              screenRef.current = "gameover";
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+      }, 50);
+      pollIntervalRef.current = iv;
+      return () => clearInterval(iv);
+    }
+  }, [screen]);
+
+  // ─── Game Loop ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (screen !== "game") return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    function updatePlayer(
+      p: Player,
+      keys: Set<string>,
+      left: string,
+      right: string,
+      jump: string,
+      leftBound: number,
+      rightBound: number,
+    ) {
+      if (keys.has(left)) {
+        p.vel.x = -PLAYER_SPEED;
+        p.facingRight = false;
+      } else if (keys.has(right)) {
+        p.vel.x = PLAYER_SPEED;
+        p.facingRight = true;
+      } else p.vel.x *= 0.75;
+      if (keys.has(jump) && p.onGround) {
+        p.vel.y = JUMP_FORCE;
+        p.onGround = false;
+      }
+      p.vel.y += GRAVITY;
+      p.pos.x += p.vel.x;
+      p.pos.y += p.vel.y;
+      if (p.pos.y >= GROUND_Y - PLAYER_RADIUS) {
+        p.pos.y = GROUND_Y - PLAYER_RADIUS;
+        p.vel.y = 0;
+        p.onGround = true;
+      }
+      p.pos.x = clamp(
+        p.pos.x,
+        leftBound + PLAYER_RADIUS,
+        rightBound - PLAYER_RADIUS,
+      );
+      if (p.hitFlash > 0) p.hitFlash--;
+    }
+
+    function updateMobileP1(p: Player, inp: typeof mobileInputRef.current) {
+      if (inp.left) {
+        p.vel.x = -PLAYER_SPEED;
+        p.facingRight = false;
+      } else if (inp.right) {
+        p.vel.x = PLAYER_SPEED;
+        p.facingRight = true;
+      } else p.vel.x *= 0.75;
+      if (inp.jump && p.onGround) {
+        p.vel.y = JUMP_FORCE;
+        p.onGround = false;
+      }
+      p.vel.y += GRAVITY;
+      p.pos.x += p.vel.x;
+      p.pos.y += p.vel.y;
+      if (p.pos.y >= GROUND_Y - PLAYER_RADIUS) {
+        p.pos.y = GROUND_Y - PLAYER_RADIUS;
+        p.vel.y = 0;
+        p.onGround = true;
+      }
+      p.pos.x = clamp(
+        p.pos.x,
+        PLAYER_RADIUS,
+        NET_X - NET_WIDTH / 2 - PLAYER_RADIUS,
+      );
+      if (p.hitFlash > 0) p.hitFlash--;
+    }
+
+    function updateAI(p2: Player, ball: Ball, diff: Difficulty) {
+      const cfg = AI_CONFIG[diff];
+      const ballOnAiSide = ball.pos.x > NET_X;
+      const inRange =
+        ballOnAiSide || dist(ball.pos, p2.pos) < cfg.reactionRange;
+      const targetX = inRange ? ball.pos.x : NET_X + 150;
+      const diffX = targetX - p2.pos.x;
+      const aiSpeed = PLAYER_SPEED * cfg.speedMult;
+
+      // Occasional random miss
+      if (Math.random() < cfg.missFactor / 60) {
+        p2.vel.x *= 0.5;
+      } else if (Math.abs(diffX) > 8) {
+        p2.vel.x = diffX > 0 ? aiSpeed : -aiSpeed;
+        p2.facingRight = diffX > 0;
+      } else {
+        p2.vel.x *= 0.75;
+      }
+
+      // Jump logic
+      const ballDescending = ball.vel.y > 0;
+      const ballClose =
+        ball.pos.y < GROUND_Y - 50 &&
+        dist(ball.pos, p2.pos) <
+          (diff === "easy" ? 180 : diff === "medium" ? 220 : 300);
+      if (
+        ballOnAiSide &&
+        ballDescending &&
+        ballClose &&
+        p2.onGround &&
+        Math.abs(diffX) < (diff === "easy" ? 150 : 250)
+      ) {
+        p2.vel.y = JUMP_FORCE;
+        p2.onGround = false;
+      }
+
+      p2.vel.y += GRAVITY;
+      p2.pos.x += p2.vel.x;
+      p2.pos.y += p2.vel.y;
+      if (p2.pos.y >= GROUND_Y - PLAYER_RADIUS) {
+        p2.pos.y = GROUND_Y - PLAYER_RADIUS;
+        p2.vel.y = 0;
+        p2.onGround = true;
+      }
+      p2.pos.x = clamp(
+        p2.pos.x,
+        NET_X + NET_WIDTH / 2 + PLAYER_RADIUS,
+        CW - PLAYER_RADIUS,
+      );
+      if (p2.hitFlash > 0) p2.hitFlash--;
+    }
+
+    function tryHitBall(
+      ball: Ball,
+      player: Player,
+      hitPressed: boolean,
+      cooldownKey: "p1" | "p2",
+      isAI: boolean,
+      diff?: Difficulty,
+    ) {
+      const cd = hitCooldownRef.current;
+      if (cd[cooldownKey] > 0) {
+        cd[cooldownKey]--;
+        return;
+      }
+
+      const d = dist(ball.pos, player.pos);
+      const contactDist = ball.radius + PLAYER_RADIUS;
+      const inRange = d < contactDist + HIT_RANGE_EXTRA;
+
+      // AI auto-hit based on difficulty
+      const shouldHit = isAI
+        ? inRange &&
+          d < contactDist + (diff ? AI_CONFIG[diff].autoHitRange : 50) &&
+          Math.random() > (diff ? AI_CONFIG[diff].missFactor : 0)
+        : inRange && hitPressed;
+
+      if (!shouldHit) return;
+
+      // Apply collision push-out
+      const nx = d > 0.1 ? (ball.pos.x - player.pos.x) / d : 0;
+      const ny = d > 0.1 ? (ball.pos.y - player.pos.y) / d : -1;
+      const overlap = contactDist - d;
+      if (overlap > 0) {
+        ball.pos.x += nx * overlap;
+        ball.pos.y += ny * overlap;
+      }
+
+      // Reflect
+      const dot = ball.vel.x * nx + ball.vel.y * ny;
+      ball.vel.x -= 2 * dot * nx;
+      ball.vel.y -= 2 * dot * ny;
+      ball.vel.x += player.vel.x * 0.4;
+      ball.vel.y += player.vel.y * 0.3;
+      capSpeed(ball.vel, MAX_BALL_SPEED);
+      if (ball.vel.y > -2) ball.vel.y = -4;
+      ball.spin = player.vel.x * 0.2;
+      player.hitFlash = 8;
+      cd[cooldownKey] = HIT_COOLDOWN_FRAMES;
+    }
+
+    function updateBall(ball: Ball) {
+      ball.vel.y += GRAVITY;
+      ball.pos.x += ball.vel.x;
+      ball.pos.y += ball.vel.y;
+      ball.angle += ball.spin;
+      ball.spin *= 0.98;
+      ball.vel.x *= 0.998;
+      capSpeed(ball.vel, MAX_BALL_SPEED);
+
+      if (ball.pos.y - ball.radius < 0) {
+        ball.pos.y = ball.radius;
+        ball.vel.y = Math.abs(ball.vel.y) * 0.7;
+      }
+      if (ball.pos.x - ball.radius < 0) {
+        ball.pos.x = ball.radius;
+        ball.vel.x = Math.abs(ball.vel.x) * 0.8;
+      }
+      if (ball.pos.x + ball.radius > CW) {
+        ball.pos.x = CW - ball.radius;
+        ball.vel.x = -Math.abs(ball.vel.x) * 0.8;
+      }
+
+      const netLeft = NET_X - NET_WIDTH / 2;
+      const netRight = NET_X + NET_WIDTH / 2;
+      const netTop = GROUND_Y - NET_H;
+      if (ball.pos.y + ball.radius > netTop) {
+        if (
+          ball.pos.x + ball.radius > netLeft &&
+          ball.pos.x < NET_X &&
+          ball.vel.x > 0
+        ) {
+          ball.pos.x = netLeft - ball.radius;
+          ball.vel.x = -Math.abs(ball.vel.x) * 0.7;
+        }
+        if (
+          ball.pos.x - ball.radius < netRight &&
+          ball.pos.x > NET_X &&
+          ball.vel.x < 0
+        ) {
+          ball.pos.x = netRight + ball.radius;
+          ball.vel.x = Math.abs(ball.vel.x) * 0.7;
+        }
+        if (
+          ball.pos.x > netLeft &&
+          ball.pos.x < netRight &&
+          ball.pos.y - ball.radius < netTop + 10
+        ) {
+          ball.pos.y = netTop - ball.radius;
+          ball.vel.y = -Math.abs(ball.vel.y) * 0.6;
+        }
+      }
+    }
+
+    // ── Draw helpers ────────────────────────────────────────────────────────
+    function drawBackground(c: CanvasRenderingContext2D) {
+      const sky = c.createLinearGradient(0, 0, 0, GROUND_Y);
+      sky.addColorStop(0, "#060916");
+      sky.addColorStop(0.5, "#0b1235");
+      sky.addColorStop(1, "#101a50");
+      c.fillStyle = sky;
+      c.fillRect(0, 0, CW, GROUND_Y);
+      // stars
+      const stars = [
+        [80, 40],
+        [200, 70],
+        [350, 30],
+        [500, 55],
+        [650, 25],
+        [780, 50],
+        [130, 100],
+        [420, 90],
+        [700, 80],
+        [50, 150],
+        [280, 120],
+        [600, 140],
+        [850, 110],
+        [160, 180],
+        [450, 160],
+        [720, 175],
+        [320, 200],
+        [580, 195],
+        [100, 220],
+        [240, 250],
+      ];
+      c.fillStyle = "rgba(255,255,255,0.65)";
+      for (const [sx, sy] of stars) {
+        c.beginPath();
+        c.arc(sx, sy, 1, 0, Math.PI * 2);
+        c.fill();
+      }
+      const ground = c.createLinearGradient(0, GROUND_Y, 0, CH);
+      ground.addColorStop(0, "#1a472a");
+      ground.addColorStop(0.3, "#155224");
+      ground.addColorStop(1, "#0d3518");
+      c.fillStyle = ground;
+      c.fillRect(0, GROUND_Y, CW, CH - GROUND_Y);
+      c.strokeStyle = "rgba(100,200,100,0.15)";
+      c.lineWidth = 1;
+      for (let i = 0; i < CW; i += 60) {
+        c.beginPath();
+        c.moveTo(i, GROUND_Y);
+        c.lineTo(i, CH);
+        c.stroke();
+      }
+      c.strokeStyle = "rgba(255,255,255,0.15)";
+      c.lineWidth = 2;
+      c.beginPath();
+      c.moveTo(0, GROUND_Y);
+      c.lineTo(CW, GROUND_Y);
+      c.stroke();
+    }
+
+    function drawNet(c: CanvasRenderingContext2D) {
+      const netTop = GROUND_Y - NET_H;
+      const colors = ["#ff4444", "#ffdd00", "#44ff88", "#4488ff", "#ff44cc"];
+      const segH = 18;
+      for (let y = netTop; y < GROUND_Y; y += segH) {
+        c.fillStyle = colors[Math.floor((y - netTop) / segH) % colors.length];
+        c.fillRect(
+          NET_X - NET_WIDTH / 2,
+          y,
+          NET_WIDTH,
+          Math.min(segH - 1, GROUND_Y - y),
+        );
+      }
+      c.fillStyle = "#aaa";
+      c.fillRect(NET_X - 2, netTop - 10, 4, 10);
+      c.fillStyle = "#fff";
+      c.fillRect(NET_X - NET_WIDTH / 2 - 1, netTop, NET_WIDTH + 2, 4);
+    }
+
+    function drawPlayer(c: CanvasRenderingContext2D, p: Player, isP1: boolean) {
+      const { pos, hitFlash } = p;
+      const r = PLAYER_RADIUS;
+      c.save();
+      c.translate(pos.x, pos.y);
+      const glowColor = isP1 ? "rgba(80,120,255,0.35)" : "rgba(255,80,80,0.35)";
+      const glow = c.createRadialGradient(0, 0, r * 0.3, 0, 0, r * 1.5);
+      glow.addColorStop(0, glowColor);
+      glow.addColorStop(1, "transparent");
+      c.fillStyle = glow;
+      c.beginPath();
+      c.arc(0, 0, r * 1.5, 0, Math.PI * 2);
+      c.fill();
+      const flash = hitFlash > 0 && hitFlash % 2 === 0;
+      if (flash) {
+        c.fillStyle = "#fff";
+      } else {
+        const bg = c.createRadialGradient(-r * 0.3, -r * 0.3, 0, 0, 0, r);
+        if (isP1) {
+          bg.addColorStop(0, "#7098ff");
+          bg.addColorStop(0.6, "#3355dd");
+          bg.addColorStop(1, "#1a2899");
+        } else {
+          bg.addColorStop(0, "#ff8888");
+          bg.addColorStop(0.6, "#ee3333");
+          bg.addColorStop(1, "#991111");
+        }
+        c.fillStyle = bg;
+      }
+      c.beginPath();
+      c.arc(0, 0, r, 0, Math.PI * 2);
+      c.fill();
+      c.strokeStyle = isP1 ? "rgba(180,200,255,0.7)" : "rgba(255,200,200,0.7)";
+      c.lineWidth = 2;
+      c.beginPath();
+      c.arc(-r * 0.2, -r * 0.2, r * 0.7, Math.PI * 1.1, Math.PI * 1.9);
+      c.stroke();
+      const eyeOX = p.facingRight ? 6 : -6;
+      c.fillStyle = "#fff";
+      c.beginPath();
+      c.arc(eyeOX - 7, -8, 5, 0, Math.PI * 2);
+      c.arc(eyeOX + 7, -8, 5, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#1a1a2e";
+      const pX = p.facingRight ? 1 : -1;
+      c.beginPath();
+      c.arc(eyeOX - 7 + pX, -8, 2.5, 0, Math.PI * 2);
+      c.arc(eyeOX + 7 + pX, -8, 2.5, 0, Math.PI * 2);
+      c.fill();
+      c.strokeStyle = "#fff";
+      c.lineWidth = 2;
+      c.beginPath();
+      c.arc(eyeOX, -2, 8, 0.1, Math.PI - 0.1);
+      c.stroke();
+      c.fillStyle = isP1 ? "#3355dd" : "#cc2222";
+      c.beginPath();
+      c.arc(0, r - 8, 9, 0, Math.PI * 2);
+      c.fill();
+      c.fillStyle = "#fff";
+      c.font = "bold 10px sans-serif";
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillText(isP1 ? "1" : "2", 0, r - 8);
+      c.restore();
+    }
+
+    function drawBall(c: CanvasRenderingContext2D, ball: Ball) {
+      c.save();
+      c.translate(ball.pos.x, ball.pos.y);
+      c.rotate(ball.angle);
+      const r = ball.radius;
+      const glow = c.createRadialGradient(0, 0, r * 0.4, 0, 0, r * 2);
+      glow.addColorStop(0, "rgba(255,230,50,0.4)");
+      glow.addColorStop(1, "transparent");
+      c.fillStyle = glow;
+      c.beginPath();
+      c.arc(0, 0, r * 2, 0, Math.PI * 2);
+      c.fill();
+      const bg = c.createRadialGradient(-r * 0.35, -r * 0.35, 0, 0, 0, r);
+      bg.addColorStop(0, "#fff7a0");
+      bg.addColorStop(0.4, "#ffe820");
+      bg.addColorStop(1, "#cc9900");
+      c.fillStyle = bg;
+      c.beginPath();
+      c.arc(0, 0, r, 0, Math.PI * 2);
+      c.fill();
+      c.strokeStyle = "rgba(100,60,0,0.5)";
+      c.lineWidth = 1.5;
+      c.beginPath();
+      c.moveTo(-r, 0);
+      c.bezierCurveTo(-r * 0.5, -r * 0.4, r * 0.5, -r * 0.4, r, 0);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(-r, 0);
+      c.bezierCurveTo(-r * 0.5, r * 0.4, r * 0.5, r * 0.4, r, 0);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(0, -r);
+      c.bezierCurveTo(-r * 0.4, -r * 0.5, -r * 0.4, r * 0.5, 0, r);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(0, -r);
+      c.bezierCurveTo(r * 0.4, -r * 0.5, r * 0.4, r * 0.5, 0, r);
+      c.stroke();
+      c.fillStyle = "rgba(255,255,255,0.45)";
+      c.beginPath();
+      c.arc(-r * 0.3, -r * 0.35, r * 0.28, 0, Math.PI * 2);
+      c.fill();
+      c.restore();
+    }
+
+    function drawHUD(
+      c: CanvasRenderingContext2D,
+      gs: GameState,
+      m: GameMode,
+      diff: Difficulty,
+      plt: Platform,
+    ) {
+      // Score board
+      c.fillStyle = "rgba(0,0,10,0.8)";
+      c.beginPath();
+      const sbW = 200;
+      const sbH = 52;
+      const sbX = CW / 2 - 100;
+      const sbY = 10;
+      c.roundRect(sbX, sbY, sbW, sbH, 10);
+      c.fill();
+      c.strokeStyle = "rgba(255,255,255,0.12)";
+      c.lineWidth = 1;
+      c.stroke();
+      c.font = "bold 32px 'Bricolage Grotesque',sans-serif";
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillStyle = "#7098ff";
+      c.fillText(String(gs.score[0]), CW / 2 - 55, sbY + sbH / 2 + 1);
+      c.fillStyle = "rgba(255,255,255,0.35)";
+      c.fillRect(CW / 2 - 5, sbY + 8, 10, sbH - 16);
+      c.fillStyle = "rgba(255,255,255,0.5)";
+      c.font = "bold 16px sans-serif";
+      c.fillText(":", CW / 2, sbY + sbH / 2 + 1);
+      c.font = "bold 32px 'Bricolage Grotesque',sans-serif";
+      c.fillStyle = "#ff6666";
+      c.fillText(String(gs.score[1]), CW / 2 + 55, sbY + sbH / 2 + 1);
+      c.font = "11px 'Figtree',sans-serif";
+      c.fillStyle = "rgba(255,255,255,0.45)";
+      c.fillText("P1", CW / 2 - 55, sbY + sbH + 10);
+      c.fillText(
+        m === "ai" ? `AI (${diff})` : "P2",
+        CW / 2 + 55,
+        sbY + sbH + 10,
+      );
+
+      // Hit key reminder for PC
+      if (plt === "pc") {
+        c.font = "11px 'Figtree',sans-serif";
+        c.fillStyle = "rgba(120,180,255,0.7)";
+        c.textAlign = "left";
+        c.fillText("P1 HIT: SPACE", 8, CH - 8);
+        if (m !== "ai") {
+          c.fillStyle = "rgba(255,120,120,0.7)";
+          c.textAlign = "right";
+          c.fillText("P2 HIT: ENTER", CW - 8, CH - 8);
+        }
+      }
+    }
+
+    function drawCelebration(
+      c: CanvasRenderingContext2D,
+      celebrating: number,
+      player: 0 | 1 | 2,
+    ) {
+      if (celebrating <= 0 || player === 0) return;
+      const alpha = Math.min(1, celebrating / 30);
+      c.fillStyle = `rgba(255,230,50,${alpha * 0.12})`;
+      c.fillRect(0, 0, CW, CH);
+      c.font = "bold 48px 'Bricolage Grotesque',sans-serif";
+      c.textAlign = "center";
+      c.textBaseline = "middle";
+      c.fillStyle = `rgba(255,230,50,${alpha})`;
+      c.fillText(player === 1 ? "POINT! P1" : "POINT! P2", CW / 2, CH / 2);
+    }
+
+    // ── Main loop ─────────────────────────────────────────────────────────
+    function frame() {
+      if (screenRef.current !== "game") return;
+      const gs = gsRef.current;
+      const keys = keysRef.current;
+      const m = modeRef.current;
+      const diff = difficultyRef.current;
+      const plt = platform;
+
+      // Guest: just render, no physics
+      if (m === "online-guest") {
+        renderFrame(gs, m, diff, plt);
+        // Send own input
+        const inp =
+          plt === "mobile"
+            ? mobileInputRef.current
+            : {
+                left: keys.has("a") || keys.has("A"),
+                right: keys.has("d") || keys.has("D"),
+                jump: keys.has("w") || keys.has("W"),
+                hit: keys.has(" "),
+              };
+        actorRef.current
+          ?.sendInput(onlineCodeRef.current, JSON.stringify(inp))
+          .catch(() => {});
+        rafRef.current = requestAnimationFrame(frame);
+        return;
+      }
+
+      if (gs.serveTimer > 0) {
+        gs.serveTimer--;
+      } else {
+        // P1 input
+        if (plt === "mobile") {
+          updateMobileP1(gs.p1, mobileInputRef.current);
+        } else {
+          updatePlayer(gs.p1, keys, "a", "d", "w", 0, NET_X - NET_WIDTH / 2);
+          updatePlayer(gs.p1, keys, "A", "D", "W", 0, NET_X - NET_WIDTH / 2);
+        }
+
+        // P2 input
+        if (m === "ai") {
+          updateAI(gs.p2, gs.ball, diff);
+        } else if (m === "online-host") {
+          const gi = guestInputRef.current;
+          const fakeKeys = new Set<string>();
+          if (gi.left) fakeKeys.add("ArrowLeft");
+          if (gi.right) fakeKeys.add("ArrowRight");
+          if (gi.jump) fakeKeys.add("ArrowUp");
+          updatePlayer(
+            gs.p2,
+            fakeKeys,
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            NET_X + NET_WIDTH / 2,
+            CW,
+          );
+        } else {
+          updatePlayer(
+            gs.p2,
+            keys,
+            "ArrowLeft",
+            "ArrowRight",
+            "ArrowUp",
+            NET_X + NET_WIDTH / 2,
+            CW,
+          );
+        }
+
+        // Hit button detection
+        const p1HitPressed =
+          plt === "mobile" ? mobileInputRef.current.hit : keys.has(" ");
+        const p2HitPressed =
+          m === "online-host"
+            ? guestInputRef.current.hit
+            : plt === "mobile"
+              ? false
+              : keys.has("Enter");
+
+        updateBall(gs.ball);
+        tryHitBall(gs.ball, gs.p1, p1HitPressed, "p1", false);
+        if (m === "ai") {
+          tryHitBall(gs.ball, gs.p2, false, "p2", true, diff);
+        } else {
+          tryHitBall(gs.ball, gs.p2, p2HitPressed, "p2", false);
+        }
+
+        // Scoring
+        if (gs.ball.pos.y + gs.ball.radius >= GROUND_Y) {
+          const scorer: 1 | 2 = gs.ball.pos.x < NET_X ? 2 : 1;
+          if (scorer === 1) gs.score[0]++;
+          else gs.score[1]++;
+          const newScore: [number, number] = [...gs.score] as [number, number];
+          setScore(newScore);
+          if (newScore[0] >= WIN_SCORE || newScore[1] >= WIN_SCORE) {
+            setWinner(newScore[0] >= WIN_SCORE ? 1 : 2);
+            setScreen("gameover");
+            screenRef.current = "gameover";
+            return;
+          }
+          gs.celebrating = 60;
+          gs.celebratingPlayer = scorer;
+          gs.serving = scorer;
+          gs.p1 = makePlayer(CW * 0.25);
+          gs.p2 = makePlayer(CW * 0.75);
+          gs.ball = makeBall(scorer);
+          gs.serveTimer = SERVE_DELAY;
+          hitCooldownRef.current = { p1: 0, p2: 0 };
+        }
+      }
+
+      if (gs.celebrating > 0) gs.celebrating--;
+
+      // Online host: send state
+      if (m === "online-host") {
+        sendStateTimerRef.current++;
+        if (sendStateTimerRef.current >= 3) {
+          sendStateTimerRef.current = 0;
+          const stateJson = JSON.stringify(gs);
+          actorRef.current
+            ?.sendState(onlineCodeRef.current, stateJson)
+            .catch(() => {});
+        }
+      }
+
+      renderFrame(gs, m, diff, plt);
+      rafRef.current = requestAnimationFrame(frame);
+    }
+
+    function renderFrame(
+      gs: GameState,
+      m: GameMode,
+      diff: Difficulty,
+      plt: Platform,
+    ) {
+      const c = canvas!;
+      const x = ctx!;
+      c.width = c.clientWidth;
+      c.height = c.clientHeight;
+      const scale = Math.min(c.width / CW, c.height / CH);
+      const offsetX = (c.width - CW * scale) / 2;
+      const offsetY = (c.height - CH * scale) / 2;
+      x.clearRect(0, 0, c.width, c.height);
+      x.fillStyle = "#050810";
+      x.fillRect(0, 0, c.width, c.height);
+      x.save();
+      x.translate(offsetX, offsetY);
+      x.scale(scale, scale);
+      drawBackground(x);
+      drawNet(x);
+      drawPlayer(x, gs.p1, true);
+      drawPlayer(x, gs.p2, false);
+      drawBall(x, gs.ball);
+      drawHUD(x, gs, m, diff, plt);
+      if (gs.celebrating > 0)
+        drawCelebration(x, gs.celebrating, gs.celebratingPlayer);
+      if (gs.serveTimer > 0) {
+        const alpha = gs.serveTimer / SERVE_DELAY;
+        x.fillStyle = `rgba(255,255,255,${alpha * 0.85})`;
+        x.font = "bold 24px 'Bricolage Grotesque',sans-serif";
+        x.textAlign = "center";
+        x.textBaseline = "middle";
+        x.fillText("GET READY!", CW / 2, CH / 2 + 60);
+      }
+      x.restore();
+    }
+
+    rafRef.current = requestAnimationFrame(frame);
+    return () => cancelAnimationFrame(rafRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screen, platform]);
+
+  // ─── Online Handlers ────────────────────────────────────────────────────
+  const handleCreateRoom = useCallback(async () => {
+    setOnlineStatus("Creating room...");
+    setOnlineWaiting(true);
+    try {
+      const code = await actorRef.current!.createRoom();
+      setRoomCode(code);
+      onlineCodeRef.current = code;
+      setOnlineStatus(`Room created! Code: ${code}`);
+      // Poll for guest
+      const iv = setInterval(async () => {
+        try {
+          const info = await actorRef.current!.getRoomInfo(code);
+          if (info?.guestJoined) {
+            clearInterval(iv);
+            startGame("online-host");
+          }
+        } catch {
+          /* ignore */
+        }
+      }, 1000);
+    } catch {
+      setOnlineStatus("Failed to create room. Try again.");
+      setOnlineWaiting(false);
+    }
+  }, [startGame]);
+
+  const handleJoinRoom = useCallback(async () => {
+    const code = joinCodeInput.trim().toUpperCase();
+    if (!code) return;
+    setOnlineStatus("Joining room...");
+    try {
+      const ok = await actorRef.current!.joinRoom(code);
+      if (ok) {
+        onlineCodeRef.current = code;
+        setRoomCode(code);
+        setOnlineStatus("Joined! Waiting for host to start...");
+        startGame("online-guest");
+      } else {
+        setOnlineStatus("Room not found or already full.");
+      }
+    } catch {
+      setOnlineStatus("Error joining room. Check the code.");
+    }
+  }, [joinCodeInput, startGame]);
+
+  // ─── Mobile Joystick Handlers ────────────────────────────────────────────
+  const joystickOuterRef = useRef<HTMLDivElement>(null);
+
+  const onJoystickStart = useCallback((e: React.TouchEvent) => {
+    e.preventDefault();
+    const rect = joystickOuterRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const cx = rect.left + rect.width / 2;
+    const cy = rect.top + rect.height / 2;
+    joystickRef.current = {
+      active: true,
+      originX: cx,
+      originY: cy,
+      dx: 0,
+      dy: 0,
+    };
+  }, []);
+
+  const onJoystickMove = useCallback((e: React.TouchEvent) => {
+    e.preventDefault();
+    if (!joystickRef.current.active) return;
+    const touch = e.touches[0];
+    const { originX, originY } = joystickRef.current;
+    const dx = touch.clientX - originX;
+    const dy = touch.clientY - originY;
+    const maxR = 40;
+    const mag = Math.sqrt(dx * dx + dy * dy);
+    const clamped = mag > maxR ? maxR / mag : 1;
+    joystickRef.current.dx = dx * clamped;
+    joystickRef.current.dy = dy * clamped;
+    const inp = mobileInputRef.current;
+    inp.left = joystickRef.current.dx < -20;
+    inp.right = joystickRef.current.dx > 20;
+    inp.jump = joystickRef.current.dy < -30;
+  }, []);
+
+  const onJoystickEnd = useCallback((e: React.TouchEvent) => {
+    e.preventDefault();
+    joystickRef.current = {
+      active: false,
+      originX: 0,
+      originY: 0,
+      dx: 0,
+      dy: 0,
+    };
+    mobileInputRef.current.left = false;
+    mobileInputRef.current.right = false;
+    mobileInputRef.current.jump = false;
+  }, []);
+
+  // ─── Render Helpers ──────────────────────────────────────────────────────
+  const btnBase =
+    "font-display font-bold rounded-xl border transition-all btn-neon";
+  const year = new Date().getFullYear();
+  const footerLink = `https://caffeine.ai?utm_source=caffeine-footer&utm_medium=referral&utm_content=${encodeURIComponent(window.location.hostname)}`;
+
+  const Footer = () => (
+    <footer className="absolute bottom-4 left-0 right-0 text-center text-white/20 text-xs">
+      © {year}. Built with ❤️ using{" "}
+      <a
+        href={footerLink}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="hover:text-white/40 transition-colors"
+      >
+        caffeine.ai
+      </a>
+    </footer>
+  );
+
+  // ─── Platform Select ─────────────────────────────────────────────────────
+  if (screen === "platform") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+        <div className="scanlines" />
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="absolute top-1/3 left-1/4 w-96 h-96 bg-blue-500/8 rounded-full blur-3xl" />
+          <div className="absolute bottom-1/3 right-1/4 w-96 h-96 bg-red-500/8 rounded-full blur-3xl" />
+        </div>
+        <div className="relative z-10 flex flex-col items-center gap-10 px-4 text-center">
+          <div>
+            <div className="font-display text-xs tracking-[0.5em] text-yellow-400/60 uppercase mb-2">
+              Volley Ball 2D
+            </div>
+            <h1 className="font-display text-6xl md:text-7xl font-bold">
+              <span className="text-blue-400 neon-blue">CHOOSE</span>{" "}
+              <span className="text-yellow-400 neon-yellow">PLATFORM</span>
+            </h1>
+            <p className="text-white/40 mt-3 text-sm">
+              Select how you'll be playing
+            </p>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-6">
+            <button
+              type="button"
+              data-ocid="platform.mobile_button"
+              onClick={() => {
+                setPlatform("mobile");
+                setScreen("menu");
+              }}
+              className={`${btnBase} text-2xl px-12 py-8 bg-purple-700/80 text-white border-purple-400/40 hover:bg-purple-600`}
+            >
+              <div className="text-5xl mb-3">📱</div>
+              MOBILE
+              <div className="text-xs text-purple-200/60 font-normal mt-1 block">
+                Joystick + Touch Controls
+              </div>
+            </button>
+            <button
+              type="button"
+              data-ocid="platform.pc_button"
+              onClick={() => {
+                setPlatform("pc");
+                setScreen("menu");
+              }}
+              className={`${btnBase} text-2xl px-12 py-8 bg-cyan-700/80 text-white border-cyan-400/40 hover:bg-cyan-600`}
+            >
+              <div className="text-5xl mb-3">🖥️</div>
+              PC
+              <div className="text-xs text-cyan-200/60 font-normal mt-1 block">
+                Keyboard Controls
+              </div>
+            </button>
+          </div>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  // ─── Menu ─────────────────────────────────────────────────────────────────
+  if (screen === "menu") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+        <div className="scanlines" />
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-blue-500/6 rounded-full blur-3xl" />
+          <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-red-500/6 rounded-full blur-3xl" />
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-64 h-64 bg-yellow-400/5 rounded-full blur-3xl" />
+        </div>
+        <div className="relative z-10 flex flex-col items-center gap-8 px-4">
+          <div className="text-center">
+            <div className="font-display text-xs tracking-[0.4em] text-yellow-400/70 uppercase mb-3">
+              Arcade Sports
+            </div>
+            <h1 className="font-display text-7xl md:text-8xl font-bold leading-none">
+              <span className="text-blue-400 neon-blue">VOLLEY</span>
+              <span className="text-yellow-400 neon-yellow">BALL</span>
+            </h1>
+            <div className="font-display text-xs tracking-[0.5em] text-green-400/70 uppercase mt-3">
+              2D Edition
+            </div>
+          </div>
+          <div className="flex flex-col gap-3 mt-2 w-full max-w-xs">
+            <button
+              type="button"
+              data-ocid="menu.friend_button"
+              onClick={() => startGame("friend")}
+              className={`${btnBase} text-xl px-10 py-4 bg-blue-600/90 text-white border-blue-400/50 hover:bg-blue-500`}
+            >
+              👥 VS FRIEND
+            </button>
+            <button
+              type="button"
+              data-ocid="menu.ai_button"
+              onClick={() => setScreen("difficulty")}
+              className={`${btnBase} text-xl px-10 py-4 bg-green-700/90 text-white border-green-400/50 hover:bg-green-600`}
+            >
+              🤖 VS AI
+            </button>
+            <button
+              type="button"
+              data-ocid="menu.online_button"
+              onClick={() => {
+                setRoomCode("");
+                setJoinCodeInput("");
+                setOnlineStatus("");
+                setOnlineWaiting(false);
+                setScreen("online");
+              }}
+              className={`${btnBase} text-xl px-10 py-4 bg-orange-600/90 text-white border-orange-400/50 hover:bg-orange-500`}
+            >
+              🌐 ONLINE MULTIPLAYER
+            </button>
+          </div>
+          {platform === "pc" && (
+            <div className="grid grid-cols-2 gap-4 mt-2 w-full max-w-xl">
+              <div className="bg-blue-900/20 border border-blue-500/20 rounded-xl p-4">
+                <div className="font-display text-blue-400 font-bold text-sm mb-3 neon-blue">
+                  🔵 PLAYER 1
+                </div>
+                <div className="space-y-1 text-sm">
+                  {[
+                    ["W", "Jump"],
+                    ["A/D", "Move"],
+                    ["SPACE", "Hit Ball"],
+                  ].map(([k, v]) => (
+                    <div key={k} className="flex items-center gap-2">
+                      <kbd className="px-2 py-0.5 bg-blue-900/50 border border-blue-500/40 rounded text-blue-200 text-xs font-mono">
+                        {k}
+                      </kbd>
+                      <span className="text-white/60">{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <div className="bg-red-900/20 border border-red-500/20 rounded-xl p-4">
+                <div className="font-display text-red-400 font-bold text-sm mb-3 neon-red">
+                  🔴 PLAYER 2
+                </div>
+                <div className="space-y-1 text-sm">
+                  {[
+                    ["↑", "Jump"],
+                    ["←/→", "Move"],
+                    ["ENTER", "Hit Ball"],
+                  ].map(([k, v]) => (
+                    <div key={k} className="flex items-center gap-2">
+                      <kbd className="px-2 py-0.5 bg-red-900/50 border border-red-500/40 rounded text-red-200 text-xs font-mono">
+                        {k}
+                      </kbd>
+                      <span className="text-white/60">{v}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          <div className="flex items-center gap-2 text-white/25 text-xs">
+            <button
+              type="button"
+              onClick={() => setScreen("platform")}
+              className="hover:text-white/50 transition-colors underline"
+            >
+              Change platform ({platform})
+            </button>
+            <span>•</span>
+            <span>First to {WIN_SCORE} points wins</span>
+          </div>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  // ─── Difficulty Select ────────────────────────────────────────────────────
+  if (screen === "difficulty") {
+    const diffs: {
+      key: Difficulty;
+      label: string;
+      icon: string;
+      color: string;
+      desc: string;
+    }[] = [
+      {
+        key: "easy",
+        label: "EASY",
+        icon: "😊",
+        color: "bg-green-700/80 border-green-400/50 hover:bg-green-600",
+        desc: "Slow AI, often misses",
+      },
+      {
+        key: "medium",
+        label: "MEDIUM",
+        icon: "😤",
+        color: "bg-yellow-600/80 border-yellow-400/50 hover:bg-yellow-500",
+        desc: "Balanced challenge",
+      },
+      {
+        key: "hard",
+        label: "HARD",
+        icon: "😈",
+        color: "bg-red-700/80 border-red-400/50 hover:bg-red-600",
+        desc: "Near-perfect AI",
+      },
+    ];
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+        <div className="scanlines" />
+        <div className="relative z-10 flex flex-col items-center gap-8 px-4 text-center">
+          <div>
+            <div className="font-display text-xs tracking-[0.5em] text-yellow-400/60 uppercase mb-2">
+              VS AI
+            </div>
+            <h1 className="font-display text-5xl font-bold text-white">
+              SELECT DIFFICULTY
+            </h1>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-4">
+            {diffs.map((d) => (
+              <button
+                key={d.key}
+                type="button"
+                data-ocid={`difficulty.${d.key}_button`}
+                onClick={() => startGame("ai", d.key)}
+                className={`${btnBase} text-xl px-10 py-6 text-white ${d.color} flex flex-col items-center gap-2`}
+              >
+                <span className="text-4xl">{d.icon}</span>
+                {d.label}
+                <span className="text-xs font-normal opacity-60">{d.desc}</span>
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => setScreen("menu")}
+            className="text-white/40 hover:text-white/70 text-sm transition-colors"
+          >
+            ← Back to Menu
+          </button>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  // ─── Online Menu ─────────────────────────────────────────────────────────
+  if (screen === "online") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+        <div className="scanlines" />
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="absolute top-1/3 left-1/3 w-80 h-80 bg-orange-500/6 rounded-full blur-3xl" />
+        </div>
+        <div className="relative z-10 flex flex-col items-center gap-8 px-4 text-center max-w-sm w-full">
+          <div>
+            <div className="font-display text-xs tracking-[0.5em] text-orange-400/60 uppercase mb-2">
+              Multiplayer
+            </div>
+            <h1 className="font-display text-5xl font-bold text-white">
+              ONLINE MODE
+            </h1>
+          </div>
+          {onlineStatus && (
+            <div
+              className={`w-full px-4 py-3 rounded-xl text-sm font-mono border ${
+                onlineStatus.includes("Failed") ||
+                onlineStatus.includes("Error") ||
+                onlineStatus.includes("not found")
+                  ? "bg-red-900/30 border-red-500/40 text-red-200"
+                  : "bg-blue-900/30 border-blue-500/40 text-blue-200"
+              }`}
+            >
+              {onlineStatus}
+              {roomCode && onlineWaiting && (
+                <div className="mt-2">
+                  <span className="block text-yellow-300 font-display text-2xl tracking-widest">
+                    {roomCode}
+                  </span>
+                  <span className="text-white/50 text-xs">
+                    Share this code with your friend
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+          {!onlineWaiting && (
+            <>
+              <button
+                type="button"
+                data-ocid="online.create_button"
+                onClick={handleCreateRoom}
+                className={`${btnBase} text-xl px-10 py-4 w-full bg-orange-600/90 text-white border-orange-400/50 hover:bg-orange-500`}
+              >
+                🏠 CREATE ROOM
+              </button>
+              <div className="w-full">
+                <div className="text-white/40 text-xs mb-3 font-display tracking-wider uppercase">
+                  — or join a room —
+                </div>
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    data-ocid="online.code_input"
+                    value={joinCodeInput}
+                    onChange={(e) =>
+                      setJoinCodeInput(e.target.value.toUpperCase())
+                    }
+                    placeholder="ENTER CODE"
+                    maxLength={8}
+                    className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/20 text-white font-mono text-center tracking-widest placeholder:text-white/20 focus:outline-none focus:border-orange-400/60"
+                  />
+                  <button
+                    type="button"
+                    data-ocid="online.join_submit_button"
+                    onClick={handleJoinRoom}
+                    className={`${btnBase} text-sm px-5 py-3 bg-blue-600/90 text-white border-blue-400/50 hover:bg-blue-500`}
+                  >
+                    JOIN
+                  </button>
+                </div>
+                <button
+                  type="button"
+                  data-ocid="online.join_button"
+                  onClick={handleJoinRoom}
+                  className={`${btnBase} text-lg px-10 py-4 w-full mt-3 bg-blue-700/80 text-white border-blue-400/40 hover:bg-blue-600`}
+                >
+                  🚀 JOIN ROOM
+                </button>
+              </div>
+            </>
+          )}
+          {onlineWaiting && (
+            <div className="flex items-center gap-3 text-white/50">
+              <div className="w-4 h-4 border-2 border-orange-400 border-t-transparent rounded-full animate-spin" />
+              Waiting for opponent...
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              setOnlineWaiting(false);
+              setScreen("menu");
+            }}
+            className="text-white/40 hover:text-white/70 text-sm transition-colors"
+          >
+            ← Back to Menu
+          </button>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  // ─── Game Screen ─────────────────────────────────────────────────────────
+  if (screen === "game") {
+    return (
+      <div
+        style={{
+          position: "fixed",
+          inset: 0,
+          background: "#050810",
+          overflow: "hidden",
+        }}
+      >
+        <canvas
+          ref={canvasRef}
+          data-ocid="game.canvas_target"
+          style={{ width: "100%", height: "100%", display: "block" }}
+          tabIndex={0}
+        />
+        {/* Mobile Controls */}
+        {platform === "mobile" && (
+          <div
+            style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
+          >
+            {/* Left: Joystick */}
+            <div
+              ref={joystickOuterRef}
+              style={{
+                position: "absolute",
+                left: 40,
+                bottom: 60,
+                width: 120,
+                height: 120,
+                borderRadius: "50%",
+                background: "rgba(255,255,255,0.08)",
+                border: "2px solid rgba(255,255,255,0.2)",
+                pointerEvents: "auto",
+                touchAction: "none",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+              }}
+              onTouchStart={onJoystickStart}
+              onTouchMove={onJoystickMove}
+              onTouchEnd={onJoystickEnd}
+            >
+              <div
+                style={{
+                  width: 48,
+                  height: 48,
+                  borderRadius: "50%",
+                  background: "rgba(100,160,255,0.7)",
+                  border: "2px solid rgba(100,160,255,0.9)",
+                  transform: `translate(${joystickRef.current.dx * 0.6}px, ${joystickRef.current.dy * 0.6}px)`,
+                  transition: joystickRef.current.active
+                    ? "none"
+                    : "transform 0.15s",
+                }}
+              />
+            </div>
+            {/* Right: Hit button */}
+            <button
+              type="button"
+              data-ocid="mobile.hit_button"
+              style={{
+                position: "absolute",
+                right: 40,
+                bottom: 60,
+                width: 100,
+                height: 100,
+                borderRadius: "50%",
+                background: mobileHitPressed
+                  ? "rgba(255,180,0,0.9)"
+                  : "rgba(255,120,0,0.6)",
+                border: "3px solid rgba(255,200,50,0.8)",
+                color: "white",
+                fontWeight: "bold",
+                fontSize: 20,
+                fontFamily: "'Bricolage Grotesque', sans-serif",
+                pointerEvents: "auto",
+                touchAction: "none",
+                boxShadow: mobileHitPressed
+                  ? "0 0 30px rgba(255,180,0,0.8)"
+                  : "0 0 15px rgba(255,120,0,0.4)",
+                cursor: "pointer",
+              }}
+              onTouchStart={(e) => {
+                e.preventDefault();
+                setMobileHitPressed(true);
+                mobileInputRef.current.hit = true;
+              }}
+              onTouchEnd={(e) => {
+                e.preventDefault();
+                setMobileHitPressed(false);
+                mobileInputRef.current.hit = false;
+              }}
+            >
+              HIT
+            </button>
+          </div>
+        )}
+        {/* Footer watermark */}
+        <div
+          style={{
+            position: "absolute",
+            bottom: 4,
+            left: 0,
+            right: 0,
+            textAlign: "center",
+            color: "rgba(255,255,255,0.12)",
+            fontSize: 11,
+            pointerEvents: "none",
+          }}
+        >
+          © {year}. Built with ❤️ using caffeine.ai
+        </div>
+      </div>
+    );
+  }
+
+  // ─── Game Over ───────────────────────────────────────────────────────────
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+      <div className="scanlines" />
+      <div className="absolute inset-0 overflow-hidden">
+        <div
+          className={`absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[600px] h-[600px] rounded-full blur-3xl ${
+            winner === 1 ? "bg-blue-500/12" : "bg-red-500/12"
+          }`}
+        />
+      </div>
+      <div className="relative z-10 flex flex-col items-center gap-6 px-4 text-center">
+        <div className="font-display text-xs tracking-[0.5em] text-yellow-400/70 uppercase">
+          Game Over
+        </div>
+        <div>
+          <div
+            className={`font-display text-8xl font-bold mb-2 ${winner === 1 ? "text-blue-400 neon-blue" : "text-red-400 neon-red"}`}
+          >
+            {winner === 1 ? "P1" : mode === "ai" ? "AI" : "P2"}
+          </div>
+          <div className="font-display text-3xl text-yellow-400 neon-yellow">
+            WINS!
+          </div>
+        </div>
+        <div className="flex items-center gap-6 bg-white/5 border border-white/10 rounded-2xl px-8 py-4">
+          <div className="text-center">
+            <div className="font-display text-5xl font-bold text-blue-400">
+              {score[0]}
+            </div>
+            <div className="text-xs text-white/40 mt-1">P1</div>
+          </div>
+          <div className="text-white/20 text-3xl">—</div>
+          <div className="text-center">
+            <div className="font-display text-5xl font-bold text-red-400">
+              {score[1]}
+            </div>
+            <div className="text-xs text-white/40 mt-1">
+              {mode === "ai" ? `AI (${difficulty})` : "P2"}
+            </div>
+          </div>
+        </div>
+        <div className="flex flex-col sm:flex-row gap-3 mt-2">
+          <button
+            type="button"
+            data-ocid="gameover.primary_button"
+            onClick={() => {
+              if (mode === "ai") setScreen("difficulty");
+              else startGame(mode);
+            }}
+            className={`${btnBase} text-lg px-8 py-3 bg-yellow-500/90 text-black border-yellow-400/60 hover:bg-yellow-400`}
+          >
+            🔄 PLAY AGAIN
+          </button>
+          <button
+            type="button"
+            data-ocid="gameover.secondary_button"
+            onClick={() => setScreen("menu")}
+            className={`${btnBase} text-lg px-8 py-3 bg-white/10 text-white border-white/20 hover:bg-white/20`}
+          >
+            🏠 MENU
+          </button>
+        </div>
+      </div>
+      <Footer />
+    </div>
+  );
+}
