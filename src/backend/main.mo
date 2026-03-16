@@ -4,7 +4,7 @@ import Array "mo:core/Array";
 import Order "mo:core/Order";
 import Time "mo:core/Time";
 import Nat "mo:core/Nat";
-import Nat64 "mo:core/Nat64";
+import Int "mo:core/Int";
 
 
 
@@ -32,11 +32,18 @@ actor {
 
   var highScores : [ScoreEntry] = [];
 
+  var roomCounter : Nat = 0;
+
   func generateRoomCode() : Text {
     let chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let charsArray : [Char] = chars.toArray();
-    let codeArray = Array.tabulate(4, func(i) { charsArray[(((i * 7) + Int.abs(Time.now())).toNat() % 36)] });
-    codeArray.toText();
+    roomCounter += 1;
+    let seed = Int.abs(Time.now()) + roomCounter * 1000;
+    let a = (seed % 36);
+    let b = ((seed / 37) % 36);
+    let c = ((seed / 1369) % 36);
+    let d = ((seed / 50653) % 36);
+    Text.fromChar(charsArray[a]) # Text.fromChar(charsArray[b]) # Text.fromChar(charsArray[c]) # Text.fromChar(charsArray[d]);
   };
 
   public shared ({ caller }) func createRoom() : async Text {

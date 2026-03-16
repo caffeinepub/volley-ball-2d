@@ -8,6 +8,8 @@ type Screen =
   | "platform"
   | "menu"
   | "difficulty"
+  | "friend-setup"
+  | "hacks"
   | "online"
   | "game"
   | "gameover";
@@ -53,6 +55,12 @@ interface OnlineInput {
   jump: boolean;
   hit: boolean;
 }
+interface HacksState {
+  bigBall: boolean;
+  speedBoost: boolean;
+  superJump: boolean;
+  tinyNet: boolean;
+}
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const WIN_SCORE = 7;
@@ -65,14 +73,13 @@ const NET_WIDTH = 14;
 const SERVE_DELAY = 90;
 const MAX_BALL_SPEED = 16;
 const HIT_COOLDOWN_FRAMES = 20;
-const HIT_RANGE_EXTRA = 12; // extra pixels beyond contact distance
+const HIT_RANGE_EXTRA = 12;
 const CW = 900;
 const CH = 500;
 const GROUND_Y = CH - 60;
 const NET_X = CW / 2;
 const NET_H = 130;
 
-// AI settings per difficulty
 const AI_CONFIG = {
   easy: {
     speedMult: 0.45,
@@ -93,6 +100,47 @@ const AI_CONFIG = {
     autoHitRange: 45,
   },
 };
+
+const HACK_DEFS: {
+  key: keyof HacksState;
+  emoji: string;
+  name: string;
+  desc: string;
+  onClass: string;
+}[] = [
+  {
+    key: "bigBall",
+    emoji: "🏐",
+    name: "BIG BALL",
+    desc: "Ball is 3x larger",
+    onClass:
+      "bg-orange-500/90 border-orange-300 text-white shadow-[0_0_20px_rgba(255,140,0,0.7)]",
+  },
+  {
+    key: "speedBoost",
+    emoji: "⚡",
+    name: "SPEED BOOST",
+    desc: "Players move faster",
+    onClass:
+      "bg-cyan-500/90 border-cyan-300 text-white shadow-[0_0_20px_rgba(0,220,255,0.7)]",
+  },
+  {
+    key: "superJump",
+    emoji: "🚀",
+    name: "SUPER JUMP",
+    desc: "Jump way higher",
+    onClass:
+      "bg-green-500/90 border-green-300 text-white shadow-[0_0_20px_rgba(50,255,100,0.7)]",
+  },
+  {
+    key: "tinyNet",
+    emoji: "🪄",
+    name: "TINY NET",
+    desc: "Net is much shorter",
+    onClass:
+      "bg-purple-500/90 border-purple-300 text-white shadow-[0_0_20px_rgba(180,80,255,0.7)]",
+  },
+];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 function clamp(v: number, min: number, max: number) {
@@ -157,10 +205,37 @@ export default function App() {
       })
       .catch(() => {});
   }, []);
+
   const [roomCode, setRoomCode] = useState("");
   const [joinCodeInput, setJoinCodeInput] = useState("");
   const [onlineStatus, setOnlineStatus] = useState("");
   const [onlineWaiting, setOnlineWaiting] = useState(false);
+  const [hacksUnlocked, setHacksUnlocked] = useState(
+    () => sessionStorage.getItem("hacksUnlocked") === "true",
+  );
+  const [hacksPasswordInput, setHacksPasswordInput] = useState("");
+  const [hacksPasswordError, setHacksPasswordError] = useState(false);
+
+  // ─── Hacks ──────────────────────────────────────────────────────────────
+  const [hacks, setHacks] = useState<HacksState>({
+    bigBall: false,
+    speedBoost: false,
+    superJump: false,
+    tinyNet: false,
+  });
+  const hacksRef = useRef<HacksState>({
+    bigBall: false,
+    speedBoost: false,
+    superJump: false,
+    tinyNet: false,
+  });
+  useEffect(() => {
+    hacksRef.current = hacks;
+  }, [hacks]);
+
+  const toggleHack = (key: keyof HacksState) => {
+    setHacks((prev) => ({ ...prev, [key]: !prev[key] }));
+  };
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const gsRef = useRef<GameState>(makeGameState());
@@ -250,8 +325,10 @@ export default function App() {
       "Enter",
     ]);
     const onKeyDown = (e: KeyboardEvent) => {
-      if (PREVENT.has(e.key)) e.preventDefault();
-      keysRef.current.add(e.key);
+      const tag = (e.target as HTMLElement)?.tagName;
+      const isTyping = tag === "INPUT" || tag === "TEXTAREA";
+      if (!isTyping && PREVENT.has(e.key)) e.preventDefault();
+      if (!isTyping) keysRef.current.add(e.key);
     };
     const onKeyUp = (e: KeyboardEvent) => keysRef.current.delete(e.key);
     window.addEventListener("keydown", onKeyDown);
@@ -268,7 +345,6 @@ export default function App() {
     const m = modeRef.current;
 
     if (m === "online-host") {
-      // Poll guest input
       const iv = setInterval(async () => {
         try {
           const raw = await actorRef.current!.getInput(onlineCodeRef.current);
@@ -285,7 +361,6 @@ export default function App() {
     }
 
     if (m === "online-guest") {
-      // Poll host state
       const iv = setInterval(async () => {
         try {
           const raw = await actorRef.current!.getState(onlineCodeRef.current);
@@ -324,16 +399,18 @@ export default function App() {
       jump: string,
       leftBound: number,
       rightBound: number,
+      speed: number,
+      jumpForce: number,
     ) {
       if (keys.has(left)) {
-        p.vel.x = -PLAYER_SPEED;
+        p.vel.x = -speed;
         p.facingRight = false;
       } else if (keys.has(right)) {
-        p.vel.x = PLAYER_SPEED;
+        p.vel.x = speed;
         p.facingRight = true;
       } else p.vel.x *= 0.75;
       if (keys.has(jump) && p.onGround) {
-        p.vel.y = JUMP_FORCE;
+        p.vel.y = jumpForce;
         p.onGround = false;
       }
       p.vel.y += GRAVITY;
@@ -352,16 +429,21 @@ export default function App() {
       if (p.hitFlash > 0) p.hitFlash--;
     }
 
-    function updateMobileP1(p: Player, inp: typeof mobileInputRef.current) {
+    function updateMobileP1(
+      p: Player,
+      inp: typeof mobileInputRef.current,
+      speed: number,
+      jumpForce: number,
+    ) {
       if (inp.left) {
-        p.vel.x = -PLAYER_SPEED;
+        p.vel.x = -speed;
         p.facingRight = false;
       } else if (inp.right) {
-        p.vel.x = PLAYER_SPEED;
+        p.vel.x = speed;
         p.facingRight = true;
       } else p.vel.x *= 0.75;
       if (inp.jump && p.onGround) {
-        p.vel.y = JUMP_FORCE;
+        p.vel.y = jumpForce;
         p.onGround = false;
       }
       p.vel.y += GRAVITY;
@@ -380,16 +462,21 @@ export default function App() {
       if (p.hitFlash > 0) p.hitFlash--;
     }
 
-    function updateAI(p2: Player, ball: Ball, diff: Difficulty) {
+    function updateAI(
+      p2: Player,
+      ball: Ball,
+      diff: Difficulty,
+      speed: number,
+      jumpForce: number,
+    ) {
       const cfg = AI_CONFIG[diff];
       const ballOnAiSide = ball.pos.x > NET_X;
       const inRange =
         ballOnAiSide || dist(ball.pos, p2.pos) < cfg.reactionRange;
       const targetX = inRange ? ball.pos.x : NET_X + 150;
       const diffX = targetX - p2.pos.x;
-      const aiSpeed = PLAYER_SPEED * cfg.speedMult;
+      const aiSpeed = speed * cfg.speedMult;
 
-      // Occasional random miss
       if (Math.random() < cfg.missFactor / 60) {
         p2.vel.x *= 0.5;
       } else if (Math.abs(diffX) > 8) {
@@ -399,7 +486,6 @@ export default function App() {
         p2.vel.x *= 0.75;
       }
 
-      // Jump logic
       const ballDescending = ball.vel.y > 0;
       const ballClose =
         ball.pos.y < GROUND_Y - 50 &&
@@ -412,7 +498,7 @@ export default function App() {
         p2.onGround &&
         Math.abs(diffX) < (diff === "easy" ? 150 : 250)
       ) {
-        p2.vel.y = JUMP_FORCE;
+        p2.vel.y = jumpForce;
         p2.onGround = false;
       }
 
@@ -450,7 +536,6 @@ export default function App() {
       const contactDist = ball.radius + PLAYER_RADIUS;
       const inRange = d < contactDist + HIT_RANGE_EXTRA;
 
-      // AI auto-hit based on difficulty
       const shouldHit = isAI
         ? inRange &&
           d < contactDist + (diff ? AI_CONFIG[diff].autoHitRange : 50) &&
@@ -459,7 +544,6 @@ export default function App() {
 
       if (!shouldHit) return;
 
-      // Apply collision push-out
       const nx = d > 0.1 ? (ball.pos.x - player.pos.x) / d : 0;
       const ny = d > 0.1 ? (ball.pos.y - player.pos.y) / d : -1;
       const overlap = contactDist - d;
@@ -468,11 +552,8 @@ export default function App() {
         ball.pos.y += ny * overlap;
       }
 
-      // Strong directional hit toward opponent's side
-      const hitDirection = cooldownKey === "p1" ? 1 : -1; // P1 hits right, P2 hits left
-      // Horizontal: strong push toward opponent, plus player momentum
+      const hitDirection = cooldownKey === "p1" ? 1 : -1;
       ball.vel.x = hitDirection * (10 + Math.random() * 3) + player.vel.x * 0.3;
-      // Vertical: strong upward launch to clear net
       ball.vel.y = -13 - Math.random() * 2;
       ball.spin = hitDirection * 1.5 + player.vel.x * 0.1;
       capSpeed(ball.vel, MAX_BALL_SPEED);
@@ -480,7 +561,7 @@ export default function App() {
       cd[cooldownKey] = HIT_COOLDOWN_FRAMES;
     }
 
-    function updateBall(ball: Ball) {
+    function updateBall(ball: Ball, netH: number) {
       ball.vel.y += GRAVITY;
       ball.pos.x += ball.vel.x;
       ball.pos.y += ball.vel.y;
@@ -504,7 +585,7 @@ export default function App() {
 
       const netLeft = NET_X - NET_WIDTH / 2;
       const netRight = NET_X + NET_WIDTH / 2;
-      const netTop = GROUND_Y - NET_H;
+      const netTop = GROUND_Y - netH;
       if (ball.pos.y + ball.radius > netTop) {
         if (
           ball.pos.x + ball.radius > netLeft &&
@@ -541,7 +622,6 @@ export default function App() {
       sky.addColorStop(1, "#101a50");
       c.fillStyle = sky;
       c.fillRect(0, 0, CW, GROUND_Y);
-      // stars
       const stars = [
         [80, 40],
         [200, 70],
@@ -592,8 +672,8 @@ export default function App() {
       c.stroke();
     }
 
-    function drawNet(c: CanvasRenderingContext2D) {
-      const netTop = GROUND_Y - NET_H;
+    function drawNet(c: CanvasRenderingContext2D, netH: number) {
+      const netTop = GROUND_Y - netH;
       const colors = ["#ff4444", "#ffdd00", "#44ff88", "#4488ff", "#ff44cc"];
       const segH = 18;
       for (let y = netTop; y < GROUND_Y; y += segH) {
@@ -728,8 +808,8 @@ export default function App() {
       m: GameMode,
       diff: Difficulty,
       plt: Platform,
+      activeHacks: HacksState,
     ) {
-      // Score board
       c.fillStyle = "rgba(0,0,10,0.8)";
       c.beginPath();
       const sbW = 200;
@@ -763,7 +843,6 @@ export default function App() {
         sbY + sbH + 10,
       );
 
-      // Hit key reminder for PC
       if (plt === "pc") {
         c.font = "11px 'Figtree',sans-serif";
         c.fillStyle = "rgba(120,180,255,0.7)";
@@ -773,6 +852,19 @@ export default function App() {
           c.fillStyle = "rgba(255,120,120,0.7)";
           c.textAlign = "right";
           c.fillText("P2 HIT: ENTER", CW - 8, CH - 8);
+        }
+
+        // Active hacks indicator
+        const activeList: string[] = [];
+        if (activeHacks.bigBall) activeList.push("🏐 BIG BALL");
+        if (activeHacks.speedBoost) activeList.push("⚡ SPEED");
+        if (activeHacks.superJump) activeList.push("🚀 SUPER JUMP");
+        if (activeHacks.tinyNet) activeList.push("🪄 TINY NET");
+        if (activeList.length > 0) {
+          c.font = "10px 'Figtree',sans-serif";
+          c.fillStyle = "rgba(255,220,50,0.6)";
+          c.textAlign = "left";
+          c.fillText(`HACKS: ${activeList.join(" · ")}`, 8, CH - 22);
         }
       }
     }
@@ -802,10 +894,19 @@ export default function App() {
       const diff = difficultyRef.current;
       const plt = platform;
 
+      // Compute dynamic hack values
+      const h = hacksRef.current;
+      const dynBallRadius = h.bigBall ? BALL_RADIUS * 2.8 : BALL_RADIUS;
+      const dynPlayerSpeed = h.speedBoost ? PLAYER_SPEED * 1.8 : PLAYER_SPEED;
+      const dynJumpForce = h.superJump ? JUMP_FORCE * 1.5 : JUMP_FORCE;
+      const dynNetH = h.tinyNet ? NET_H * 0.4 : NET_H;
+
+      // Apply dynamic ball radius
+      gs.ball.radius = dynBallRadius;
+
       // Guest: just render, no physics
       if (m === "online-guest") {
-        renderFrame(gs, m, diff, plt);
-        // Send own input
+        renderFrame(gs, m, diff, plt, dynNetH, h);
         const inp =
           plt === "mobile"
             ? mobileInputRef.current
@@ -827,15 +928,30 @@ export default function App() {
       } else {
         // P1 input
         if (plt === "mobile") {
-          updateMobileP1(gs.p1, mobileInputRef.current);
+          updateMobileP1(
+            gs.p1,
+            mobileInputRef.current,
+            dynPlayerSpeed,
+            dynJumpForce,
+          );
         } else {
           const p1Keys = new Set([...keys].map((k) => k.toLowerCase()));
-          updatePlayer(gs.p1, p1Keys, "a", "d", "w", 0, NET_X - NET_WIDTH / 2);
+          updatePlayer(
+            gs.p1,
+            p1Keys,
+            "a",
+            "d",
+            "w",
+            0,
+            NET_X - NET_WIDTH / 2,
+            dynPlayerSpeed,
+            dynJumpForce,
+          );
         }
 
         // P2 input
         if (m === "ai") {
-          updateAI(gs.p2, gs.ball, diff);
+          updateAI(gs.p2, gs.ball, diff, dynPlayerSpeed, dynJumpForce);
         } else if (m === "online-host") {
           const gi = guestInputRef.current;
           const fakeKeys = new Set<string>();
@@ -850,6 +966,8 @@ export default function App() {
             "ArrowUp",
             NET_X + NET_WIDTH / 2,
             CW,
+            dynPlayerSpeed,
+            dynJumpForce,
           );
         } else {
           updatePlayer(
@@ -860,10 +978,11 @@ export default function App() {
             "ArrowUp",
             NET_X + NET_WIDTH / 2,
             CW,
+            dynPlayerSpeed,
+            dynJumpForce,
           );
         }
 
-        // Hit button detection
         const p1HitPressed =
           plt === "mobile" ? mobileInputRef.current.hit : keys.has(" ");
         const p2HitPressed =
@@ -873,7 +992,7 @@ export default function App() {
               ? false
               : keys.has("Enter");
 
-        updateBall(gs.ball);
+        updateBall(gs.ball, dynNetH);
         tryHitBall(gs.ball, gs.p1, p1HitPressed, "p1", false);
         if (m === "ai") {
           tryHitBall(gs.ball, gs.p2, false, "p2", true, diff);
@@ -900,6 +1019,7 @@ export default function App() {
           gs.p1 = makePlayer(CW * 0.25);
           gs.p2 = makePlayer(CW * 0.75);
           gs.ball = makeBall(scorer);
+          gs.ball.radius = dynBallRadius;
           gs.serveTimer = SERVE_DELAY;
           hitCooldownRef.current = { p1: 0, p2: 0 };
         }
@@ -907,19 +1027,17 @@ export default function App() {
 
       if (gs.celebrating > 0) gs.celebrating--;
 
-      // Online host: send state
       if (m === "online-host") {
         sendStateTimerRef.current++;
         if (sendStateTimerRef.current >= 3) {
           sendStateTimerRef.current = 0;
-          const stateJson = JSON.stringify(gs);
           actorRef.current
-            ?.sendState(onlineCodeRef.current, stateJson)
+            ?.sendState(onlineCodeRef.current, JSON.stringify(gs))
             .catch(() => {});
         }
       }
 
-      renderFrame(gs, m, diff, plt);
+      renderFrame(gs, m, diff, plt, dynNetH, h);
       rafRef.current = requestAnimationFrame(frame);
     }
 
@@ -928,6 +1046,8 @@ export default function App() {
       m: GameMode,
       diff: Difficulty,
       plt: Platform,
+      netH: number,
+      activeHacks: HacksState,
     ) {
       const c = canvas!;
       const x = ctx!;
@@ -943,11 +1063,11 @@ export default function App() {
       x.translate(offsetX, offsetY);
       x.scale(scale, scale);
       drawBackground(x);
-      drawNet(x);
+      drawNet(x, netH);
       drawPlayer(x, gs.p1, true);
       drawPlayer(x, gs.p2, false);
       drawBall(x, gs.ball);
-      drawHUD(x, gs, m, diff, plt);
+      drawHUD(x, gs, m, diff, plt, activeHacks);
       if (gs.celebrating > 0)
         drawCelebration(x, gs.celebrating, gs.celebratingPlayer);
       if (gs.serveTimer > 0) {
@@ -968,14 +1088,22 @@ export default function App() {
 
   // ─── Online Handlers ────────────────────────────────────────────────────
   const handleCreateRoom = useCallback(async () => {
+    if (!actorRef.current) {
+      setOnlineStatus("Connecting...");
+      try {
+        actorRef.current = await createActorWithConfig();
+      } catch {
+        setOnlineStatus("Still connecting... please try again.");
+        return;
+      }
+    }
     setOnlineStatus("Creating room...");
     setOnlineWaiting(true);
     try {
-      const code = await actorRef.current!.createRoom();
+      const code = await actorRef.current.createRoom();
       setRoomCode(code);
       onlineCodeRef.current = code;
-      setOnlineStatus(`Room created! Code: ${code}`);
-      // Poll for guest
+      setOnlineStatus("Room created! Waiting for opponent...");
       const iv = setInterval(async () => {
         try {
           const info = await actorRef.current!.getRoomInfo(code);
@@ -994,11 +1122,15 @@ export default function App() {
   }, [startGame]);
 
   const handleJoinRoom = useCallback(async () => {
+    if (!actorRef.current) {
+      setOnlineStatus("Still connecting... try again in a second");
+      return;
+    }
     const code = joinCodeInput.trim().toUpperCase();
     if (!code) return;
     setOnlineStatus("Joining room...");
     try {
-      const ok = await actorRef.current!.joinRoom(code);
+      const ok = await actorRef.current.joinRoom(code);
       if (ok) {
         onlineCodeRef.current = code;
         setRoomCode(code);
@@ -1080,6 +1212,45 @@ export default function App() {
         caffeine.ai
       </a>
     </footer>
+  );
+
+  // ─── Hack Toggle Component ───────────────────────────────────────────────
+  const HackToggles = () => (
+    <div className="grid grid-cols-2 gap-3 w-full max-w-md">
+      {HACK_DEFS.map((hd) => {
+        const on = hacks[hd.key];
+        return (
+          <button
+            key={hd.key}
+            type="button"
+            data-ocid={`hacks.${hd.key}.toggle`}
+            onClick={() => toggleHack(hd.key)}
+            className={`rounded-xl border-2 px-4 py-3 text-left transition-all duration-200 ${
+              on
+                ? hd.onClass
+                : "bg-gray-800/80 border-gray-600/50 text-white/50 hover:border-gray-400/50"
+            }`}
+          >
+            <div className="flex items-center gap-2 mb-1">
+              <span className="text-xl">{hd.emoji}</span>
+              <span
+                className={`font-display font-bold text-sm ${on ? "" : "opacity-50"}`}
+              >
+                {hd.name}
+              </span>
+              {on && (
+                <span className="ml-auto text-xs font-bold bg-white/20 rounded-full px-2 py-0.5">
+                  ON
+                </span>
+              )}
+            </div>
+            <div className={`text-xs ${on ? "opacity-75" : "opacity-30"}`}>
+              {hd.desc}
+            </div>
+          </button>
+        );
+      })}
+    </div>
   );
 
   // ─── Platform Select ─────────────────────────────────────────────────────
@@ -1169,7 +1340,7 @@ export default function App() {
             <button
               type="button"
               data-ocid="menu.friend_button"
-              onClick={() => startGame("friend")}
+              onClick={() => setScreen("friend-setup")}
               className={`${btnBase} text-xl px-10 py-4 bg-blue-600/90 text-white border-blue-400/50 hover:bg-blue-500`}
             >
               👥 VS FRIEND
@@ -1195,6 +1366,19 @@ export default function App() {
               className={`${btnBase} text-xl px-10 py-4 bg-orange-600/90 text-white border-orange-400/50 hover:bg-orange-500`}
             >
               🌐 ONLINE MULTIPLAYER
+            </button>
+            <button
+              type="button"
+              data-ocid="menu.hacks_button"
+              onClick={() => setScreen("hacks")}
+              className={`${btnBase} text-xl px-10 py-4 bg-purple-800/80 text-white border-purple-400/40 hover:bg-purple-700 relative overflow-hidden`}
+            >
+              <span className="relative z-10">🎮 HACKS</span>
+              {Object.values(hacks).some(Boolean) && (
+                <span className="ml-2 text-xs bg-yellow-400 text-black rounded-full px-2 py-0.5 font-bold">
+                  {Object.values(hacks).filter(Boolean).length} ON
+                </span>
+              )}
             </button>
           </div>
           {platform === "pc" && (
@@ -1314,6 +1498,227 @@ export default function App() {
               </button>
             ))}
           </div>
+          {Object.values(hacks).some(Boolean) && (
+            <div className="text-yellow-400/70 text-xs font-mono bg-yellow-400/10 border border-yellow-400/20 rounded-lg px-4 py-2">
+              ⚡ {Object.values(hacks).filter(Boolean).length} hack
+              {Object.values(hacks).filter(Boolean).length > 1 ? "s" : ""}{" "}
+              active
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => setScreen("menu")}
+            className="text-white/40 hover:text-white/70 text-sm transition-colors"
+          >
+            ← Back to Menu
+          </button>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  // ─── Friend Setup ─────────────────────────────────────────────────────────
+  if (screen === "friend-setup") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+        <div className="scanlines" />
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="absolute top-1/3 left-1/4 w-96 h-96 bg-blue-500/6 rounded-full blur-3xl" />
+          <div className="absolute bottom-1/3 right-1/4 w-96 h-96 bg-red-500/6 rounded-full blur-3xl" />
+        </div>
+        <div className="relative z-10 flex flex-col items-center gap-8 px-4 text-center">
+          <div>
+            <div className="font-display text-xs tracking-[0.5em] text-yellow-400/60 uppercase mb-2">
+              Local Multiplayer
+            </div>
+            <h1 className="font-display text-5xl font-bold">
+              <span className="text-blue-400 neon-blue">VS</span>{" "}
+              <span className="text-white">FRIEND</span>
+            </h1>
+            <p className="text-white/40 mt-2 text-sm">
+              Local 2-Player · Same Keyboard
+            </p>
+          </div>
+
+          {/* Controls reference */}
+          <div className="grid grid-cols-2 gap-4 w-full max-w-lg">
+            <div className="bg-blue-900/20 border border-blue-500/20 rounded-xl p-4">
+              <div className="font-display text-blue-400 font-bold text-sm mb-3 neon-blue">
+                🔵 PLAYER 1
+              </div>
+              <div className="space-y-1 text-sm">
+                {[
+                  ["W", "Jump"],
+                  ["A/D", "Move"],
+                  ["SPACE", "Hit Ball"],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-2">
+                    <kbd className="px-2 py-0.5 bg-blue-900/50 border border-blue-500/40 rounded text-blue-200 text-xs font-mono">
+                      {k}
+                    </kbd>
+                    <span className="text-white/60">{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="bg-red-900/20 border border-red-500/20 rounded-xl p-4">
+              <div className="font-display text-red-400 font-bold text-sm mb-3 neon-red">
+                🔴 PLAYER 2
+              </div>
+              <div className="space-y-1 text-sm">
+                {[
+                  ["↑", "Jump"],
+                  ["←/→", "Move"],
+                  ["ENTER", "Hit Ball"],
+                ].map(([k, v]) => (
+                  <div key={k} className="flex items-center gap-2">
+                    <kbd className="px-2 py-0.5 bg-red-900/50 border border-red-500/40 rounded text-red-200 text-xs font-mono">
+                      {k}
+                    </kbd>
+                    <span className="text-white/60">{v}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Hack toggles */}
+          <div className="flex flex-col items-center gap-3 w-full">
+            <div className="font-display text-xs tracking-[0.4em] text-purple-400/70 uppercase">
+              🎮 Optional Hacks
+            </div>
+            <HackToggles />
+          </div>
+
+          {/* Start button */}
+          <button
+            type="button"
+            data-ocid="friend-setup.primary_button"
+            onClick={() => startGame("friend")}
+            className={`${btnBase} text-2xl px-16 py-5 bg-green-600/90 text-white border-green-400/50 hover:bg-green-500 shadow-[0_0_30px_rgba(50,200,100,0.35)]`}
+          >
+            🏐 START GAME
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setScreen("menu")}
+            className="text-white/40 hover:text-white/70 text-sm transition-colors"
+          >
+            ← Back to Menu
+          </button>
+        </div>
+        <Footer />
+      </div>
+    );
+  }
+
+  // ─── Hacks Screen ─────────────────────────────────────────────────────────
+  if (screen === "hacks") {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
+        <div className="scanlines" />
+        <div className="absolute inset-0 overflow-hidden">
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-purple-500/6 rounded-full blur-3xl" />
+        </div>
+        <div className="relative z-10 flex flex-col items-center gap-8 px-4 text-center">
+          <div>
+            <div className="font-display text-xs tracking-[0.5em] text-purple-400/60 uppercase mb-2">
+              Cheat Codes
+            </div>
+            <h1 className="font-display text-5xl font-bold">
+              <span
+                className="text-purple-400"
+                style={{ textShadow: "0 0 20px rgba(180,80,255,0.7)" }}
+              >
+                HACKS
+              </span>
+            </h1>
+          </div>
+
+          {!hacksUnlocked ? (
+            /* Password gate */
+            <div className="flex flex-col items-center gap-4 w-full max-w-xs">
+              <p className="text-white/50 text-sm">Enter password to unlock</p>
+              <input
+                data-ocid="hacks.input"
+                type="password"
+                value={hacksPasswordInput}
+                onChange={(e) => {
+                  setHacksPasswordInput(e.target.value);
+                  setHacksPasswordError(false);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    if (hacksPasswordInput === "kitesofdoom2939") {
+                      setHacksUnlocked(true);
+                      sessionStorage.setItem("hacksUnlocked", "true");
+                      setHacksPasswordInput("");
+                      setHacksPasswordError(false);
+                    } else {
+                      setHacksPasswordError(true);
+                    }
+                  }
+                }}
+                placeholder="Password"
+                className="w-full px-4 py-3 rounded-lg bg-white/10 border border-white/20 text-white placeholder-white/30 text-center tracking-widest focus:outline-none focus:border-purple-400/70"
+              />
+              {hacksPasswordError && (
+                <p
+                  data-ocid="hacks.error_state"
+                  className="text-red-400 text-sm font-semibold"
+                >
+                  Wrong password
+                </p>
+              )}
+              <button
+                type="button"
+                data-ocid="hacks.submit_button"
+                onClick={() => {
+                  if (hacksPasswordInput === "kitesofdoom2939") {
+                    setHacksUnlocked(true);
+                    sessionStorage.setItem("hacksUnlocked", "true");
+                    setHacksPasswordInput("");
+                    setHacksPasswordError(false);
+                  } else {
+                    setHacksPasswordError(true);
+                  }
+                }}
+                className={`${btnBase} text-lg px-10 py-3 bg-purple-700/90 text-white border-purple-400/50 hover:bg-purple-600 w-full`}
+              >
+                🔓 UNLOCK
+              </button>
+            </div>
+          ) : (
+            /* Unlocked: show hacks */
+            <>
+              <p className="text-white/40 text-sm -mt-4">
+                Toggle power-ups for extra fun
+              </p>
+              <HackToggles />
+              {/* Play buttons */}
+              <div className="flex flex-col sm:flex-row gap-3 mt-2">
+                <button
+                  type="button"
+                  data-ocid="hacks.ai_button"
+                  onClick={() => setScreen("difficulty")}
+                  className={`${btnBase} text-lg px-8 py-3 bg-green-700/90 text-white border-green-400/50 hover:bg-green-600`}
+                >
+                  🤖 PLAY VS AI
+                </button>
+                <button
+                  type="button"
+                  data-ocid="hacks.friend_button"
+                  onClick={() => setScreen("friend-setup")}
+                  className={`${btnBase} text-lg px-8 py-3 bg-blue-600/90 text-white border-blue-400/50 hover:bg-blue-500`}
+                >
+                  👥 PLAY VS FRIEND
+                </button>
+              </div>
+            </>
+          )}
+
           <button
             type="button"
             onClick={() => setScreen("menu")}
@@ -1329,13 +1734,19 @@ export default function App() {
 
   // ─── Online Menu ─────────────────────────────────────────────────────────
   if (screen === "online") {
+    const isError =
+      onlineStatus.includes("Failed") ||
+      onlineStatus.includes("Error") ||
+      onlineStatus.includes("not found") ||
+      onlineStatus.includes("Still connecting");
+
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-background relative overflow-hidden">
         <div className="scanlines" />
         <div className="absolute inset-0 overflow-hidden">
           <div className="absolute top-1/3 left-1/3 w-80 h-80 bg-orange-500/6 rounded-full blur-3xl" />
         </div>
-        <div className="relative z-10 flex flex-col items-center gap-8 px-4 text-center max-w-sm w-full">
+        <div className="relative z-10 flex flex-col items-center gap-6 px-4 text-center max-w-sm w-full">
           <div>
             <div className="font-display text-xs tracking-[0.5em] text-orange-400/60 uppercase mb-2">
               Multiplayer
@@ -1344,81 +1755,93 @@ export default function App() {
               ONLINE MODE
             </h1>
           </div>
+
+          {/* Status message */}
           {onlineStatus && (
             <div
               className={`w-full px-4 py-3 rounded-xl text-sm font-mono border ${
-                onlineStatus.includes("Failed") ||
-                onlineStatus.includes("Error") ||
-                onlineStatus.includes("not found")
+                isError
                   ? "bg-red-900/30 border-red-500/40 text-red-200"
                   : "bg-blue-900/30 border-blue-500/40 text-blue-200"
               }`}
             >
               {onlineStatus}
-              {roomCode && onlineWaiting && (
-                <div className="mt-2">
-                  <span className="block text-yellow-300 font-display text-2xl tracking-widest">
-                    {roomCode}
-                  </span>
-                  <span className="text-white/50 text-xs">
-                    Share this code with your friend
-                  </span>
-                </div>
-              )}
             </div>
           )}
-          {!onlineWaiting && (
-            <>
+
+          {/* Room code display when waiting */}
+          {onlineWaiting && roomCode && (
+            <div className="w-full flex flex-col items-center gap-3 bg-orange-900/20 border border-orange-400/30 rounded-2xl p-6">
+              <div className="text-orange-400/70 text-xs font-display tracking-widest uppercase">
+                Your Room Code
+              </div>
+              <div
+                className="font-display text-5xl font-bold tracking-[0.3em] text-yellow-300"
+                style={{ textShadow: "0 0 20px rgba(255,220,0,0.5)" }}
+              >
+                {roomCode}
+              </div>
               <button
                 type="button"
-                data-ocid="online.create_button"
-                onClick={handleCreateRoom}
-                className={`${btnBase} text-xl px-10 py-4 w-full bg-orange-600/90 text-white border-orange-400/50 hover:bg-orange-500`}
+                data-ocid="online.copy_button"
+                onClick={() =>
+                  navigator.clipboard.writeText(roomCode).catch(() => {})
+                }
+                className={`${btnBase} text-sm px-6 py-2 bg-white/10 text-white border-white/20 hover:bg-white/20`}
               >
-                🏠 CREATE ROOM
+                📋 COPY CODE
               </button>
-              <div className="w-full">
-                <div className="text-white/40 text-xs mb-3 font-display tracking-wider uppercase">
-                  — or join a room —
-                </div>
-                <div className="flex gap-2">
-                  <input
-                    type="text"
-                    data-ocid="online.code_input"
-                    value={joinCodeInput}
-                    onChange={(e) =>
-                      setJoinCodeInput(e.target.value.toUpperCase())
-                    }
-                    placeholder="ENTER CODE"
-                    maxLength={8}
-                    className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/20 text-white font-mono text-center tracking-widest placeholder:text-white/20 focus:outline-none focus:border-orange-400/60"
-                  />
-                  <button
-                    type="button"
-                    data-ocid="online.join_submit_button"
-                    onClick={handleJoinRoom}
-                    className={`${btnBase} text-sm px-5 py-3 bg-blue-600/90 text-white border-blue-400/50 hover:bg-blue-500`}
-                  >
-                    JOIN
-                  </button>
-                </div>
-                <button
-                  type="button"
-                  data-ocid="online.join_button"
-                  onClick={handleJoinRoom}
-                  className={`${btnBase} text-lg px-10 py-4 w-full mt-3 bg-blue-700/80 text-white border-blue-400/40 hover:bg-blue-600`}
-                >
-                  🚀 JOIN ROOM
-                </button>
+              <div className="text-white/40 text-xs">
+                Share this code with your friend
               </div>
-            </>
-          )}
-          {onlineWaiting && (
-            <div className="flex items-center gap-3 text-white/50">
-              <div className="w-4 h-4 border-2 border-orange-400 border-t-transparent rounded-full animate-spin" />
-              Waiting for opponent...
+              <div className="flex items-center gap-2 text-white/40 text-xs">
+                <div className="w-3 h-3 border-2 border-orange-400 border-t-transparent rounded-full animate-spin" />
+                Waiting for opponent to join...
+              </div>
             </div>
           )}
+
+          {/* Create room — hidden when waiting */}
+          {!onlineWaiting && (
+            <button
+              type="button"
+              data-ocid="online.create_button"
+              onClick={handleCreateRoom}
+              className={`${btnBase} text-xl px-10 py-4 w-full bg-orange-600/90 text-white border-orange-400/50 hover:bg-orange-500`}
+            >
+              🏠 CREATE ROOM
+            </button>
+          )}
+
+          {/* Join room — always visible */}
+          <div className="w-full">
+            <div className="text-white/40 text-xs mb-3 font-display tracking-wider uppercase">
+              — or join a room —
+            </div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                data-ocid="online.code_input"
+                value={joinCodeInput}
+                onChange={(e) => setJoinCodeInput(e.target.value.toUpperCase())}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleJoinRoom();
+                }}
+                placeholder="ENTER CODE"
+                maxLength={8}
+                className="flex-1 px-4 py-3 rounded-xl bg-white/5 border border-white/20 text-white font-mono text-center tracking-widest placeholder:text-white/20 focus:outline-none focus:border-orange-400/60"
+              />
+              <button
+                type="button"
+                data-ocid="online.join_submit_button"
+                onClick={handleJoinRoom}
+                className={`${btnBase} text-sm px-5 py-3 bg-blue-600/90 text-white border-blue-400/50 hover:bg-blue-500`}
+              >
+                JOIN
+              </button>
+            </div>
+          </div>
+
           <button
             type="button"
             onClick={() => {
@@ -1457,7 +1880,6 @@ export default function App() {
           <div
             style={{ position: "absolute", inset: 0, pointerEvents: "none" }}
           >
-            {/* Left: Joystick */}
             <div
               ref={joystickOuterRef}
               style={{
@@ -1493,7 +1915,6 @@ export default function App() {
                 }}
               />
             </div>
-            {/* Right: Hit button */}
             <button
               type="button"
               data-ocid="mobile.hit_button"
@@ -1534,7 +1955,6 @@ export default function App() {
             </button>
           </div>
         )}
-        {/* Footer watermark */}
         <div
           style={{
             position: "absolute",
@@ -1601,6 +2021,7 @@ export default function App() {
             data-ocid="gameover.primary_button"
             onClick={() => {
               if (mode === "ai") setScreen("difficulty");
+              else if (mode === "friend") setScreen("friend-setup");
               else startGame(mode);
             }}
             className={`${btnBase} text-lg px-8 py-3 bg-yellow-500/90 text-black border-yellow-400/60 hover:bg-yellow-400`}
