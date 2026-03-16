@@ -5,9 +5,9 @@ import Order "mo:core/Order";
 import Time "mo:core/Time";
 import Nat "mo:core/Nat";
 import Nat64 "mo:core/Nat64";
-import Migration "migration";
 
-(with migration = Migration.run)
+
+
 actor {
   type Room = {
     hostJoined : Bool;

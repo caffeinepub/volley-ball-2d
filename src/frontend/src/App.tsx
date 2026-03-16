@@ -468,15 +468,14 @@ export default function App() {
         ball.pos.y += ny * overlap;
       }
 
-      // Reflect
-      const dot = ball.vel.x * nx + ball.vel.y * ny;
-      ball.vel.x -= 2 * dot * nx;
-      ball.vel.y -= 2 * dot * ny;
-      ball.vel.x += player.vel.x * 0.4;
-      ball.vel.y += player.vel.y * 0.3;
+      // Strong directional hit toward opponent's side
+      const hitDirection = cooldownKey === "p1" ? 1 : -1; // P1 hits right, P2 hits left
+      // Horizontal: strong push toward opponent, plus player momentum
+      ball.vel.x = hitDirection * (10 + Math.random() * 3) + player.vel.x * 0.3;
+      // Vertical: strong upward launch to clear net
+      ball.vel.y = -13 - Math.random() * 2;
+      ball.spin = hitDirection * 1.5 + player.vel.x * 0.1;
       capSpeed(ball.vel, MAX_BALL_SPEED);
-      if (ball.vel.y > -2) ball.vel.y = -4;
-      ball.spin = player.vel.x * 0.2;
       player.hitFlash = 8;
       cd[cooldownKey] = HIT_COOLDOWN_FRAMES;
     }
@@ -830,8 +829,8 @@ export default function App() {
         if (plt === "mobile") {
           updateMobileP1(gs.p1, mobileInputRef.current);
         } else {
-          updatePlayer(gs.p1, keys, "a", "d", "w", 0, NET_X - NET_WIDTH / 2);
-          updatePlayer(gs.p1, keys, "A", "D", "W", 0, NET_X - NET_WIDTH / 2);
+          const p1Keys = new Set([...keys].map((k) => k.toLowerCase()));
+          updatePlayer(gs.p1, p1Keys, "a", "d", "w", 0, NET_X - NET_WIDTH / 2);
         }
 
         // P2 input
