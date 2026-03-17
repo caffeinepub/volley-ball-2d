@@ -253,10 +253,6 @@ export default function App() {
     hit: false,
   });
   const sendStateTimerRef = useRef(0);
-  const guestSendTimerRef = useRef(0);
-  const prevGsRef = useRef<GameState | null>(null);
-  const interpTRef = useRef(0);
-  const lastFrameTimeRef = useRef(0);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Mobile joystick state
@@ -361,7 +357,7 @@ export default function App() {
         } catch {
           /* ignore */
         }
-      }, 50);
+      }, 100);
       pollIntervalRef.current = iv;
       return () => clearInterval(iv);
     }
@@ -372,8 +368,6 @@ export default function App() {
           const raw = await actorRef.current!.getState(onlineCodeRef.current);
           if (raw) {
             const parsed = JSON.parse(raw) as GameState;
-            prevGsRef.current = gsRef.current;
-            interpTRef.current = 0;
             gsRef.current = parsed;
             setScore([...parsed.score] as [number, number]);
             if (parsed.score[0] >= WIN_SCORE || parsed.score[1] >= WIN_SCORE) {
@@ -894,14 +888,7 @@ export default function App() {
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────
-    const TARGET_FPS = 32;
-    const FRAME_MS = 1000 / TARGET_FPS;
-    function frame(now: number) {
-      if (now - lastFrameTimeRef.current < FRAME_MS) {
-        rafRef.current = requestAnimationFrame(frame);
-        return;
-      }
-      lastFrameTimeRef.current = now;
+    function frame() {
       if (screenRef.current !== "game") return;
       const gs = gsRef.current;
       const keys = keysRef.current;
@@ -921,41 +908,19 @@ export default function App() {
 
       // Guest: just render, no physics
       if (m === "online-guest") {
-        // Interpolate ball position between prev and current state for smooth rendering
-        const prevGs = prevGsRef.current;
-        interpTRef.current = Math.min(1, interpTRef.current + 0.18);
-        let renderGs = gs;
-        if (prevGs) {
-          const t = interpTRef.current;
-          renderGs = {
-            ...gs,
-            ball: {
-              ...gs.ball,
-              pos: {
-                x: prevGs.ball.pos.x + (gs.ball.pos.x - prevGs.ball.pos.x) * t,
-                y: prevGs.ball.pos.y + (gs.ball.pos.y - prevGs.ball.pos.y) * t,
-              },
-            },
-          };
-        }
-        renderFrame(renderGs, m, diff, plt, dynNetH, h);
-        // Cap guest sendInput to every 3 frames
-        guestSendTimerRef.current++;
-        if (guestSendTimerRef.current >= 3) {
-          guestSendTimerRef.current = 0;
-          const inp =
-            plt === "mobile"
-              ? mobileInputRef.current
-              : {
-                  left: keys.has("a") || keys.has("A"),
-                  right: keys.has("d") || keys.has("D"),
-                  jump: keys.has("w") || keys.has("W"),
-                  hit: keys.has(" "),
-                };
-          actorRef.current
-            ?.sendInput(onlineCodeRef.current, JSON.stringify(inp))
-            .catch(() => {});
-        }
+        renderFrame(gs, m, diff, plt, dynNetH, h);
+        const inp =
+          plt === "mobile"
+            ? mobileInputRef.current
+            : {
+                left: keys.has("a") || keys.has("A"),
+                right: keys.has("d") || keys.has("D"),
+                jump: keys.has("w") || keys.has("W"),
+                hit: keys.has(" "),
+              };
+        actorRef.current
+          ?.sendInput(onlineCodeRef.current, JSON.stringify(inp))
+          .catch(() => {});
         rafRef.current = requestAnimationFrame(frame);
         return;
       }
@@ -1088,10 +1053,8 @@ export default function App() {
     ) {
       const c = canvas!;
       const x = ctx!;
-      if (c.width !== c.clientWidth || c.height !== c.clientHeight) {
-        c.width = c.clientWidth;
-        c.height = c.clientHeight;
-      }
+      c.width = c.clientWidth;
+      c.height = c.clientHeight;
       const scale = Math.min(c.width / CW, c.height / CH);
       const offsetX = (c.width - CW * scale) / 2;
       const offsetY = (c.height - CH * scale) / 2;
