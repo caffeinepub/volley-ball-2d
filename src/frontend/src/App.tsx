@@ -252,10 +252,9 @@ export default function App() {
     jump: false,
     hit: false,
   });
-  const sendStateTimerRef = useRef(0);
-  const guestSendTimerRef = useRef(0);
   const prevGsRef = useRef<GameState | null>(null);
   const interpTRef = useRef(0);
+  const predGsRef = useRef<GameState>(makeGameState());
   const lastFrameTimeRef = useRef(0);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -361,7 +360,7 @@ export default function App() {
         } catch {
           /* ignore */
         }
-      }, 50);
+      }, 30);
       pollIntervalRef.current = iv;
       return () => clearInterval(iv);
     }
@@ -372,9 +371,16 @@ export default function App() {
           const raw = await actorRef.current!.getState(onlineCodeRef.current);
           if (raw) {
             const parsed = JSON.parse(raw) as GameState;
-            prevGsRef.current = gsRef.current;
-            interpTRef.current = 0;
+            const prev = gsRef.current;
             gsRef.current = parsed;
+            // Sync velocities into prediction state so extrapolation uses latest values
+            predGsRef.current.ball.vel = { ...parsed.ball.vel };
+            predGsRef.current.ball.spin = parsed.ball.spin;
+            // Snap players to authoritative position (they're less critical to smooth)
+            predGsRef.current.p1 = JSON.parse(JSON.stringify(parsed.p1));
+            predGsRef.current.p2 = JSON.parse(JSON.stringify(parsed.p2));
+            prevGsRef.current = prev;
+            interpTRef.current = 0;
             setScore([...parsed.score] as [number, number]);
             if (parsed.score[0] >= WIN_SCORE || parsed.score[1] >= WIN_SCORE) {
               setWinner(parsed.score[0] >= WIN_SCORE ? 1 : 2);
@@ -385,7 +391,7 @@ export default function App() {
         } catch {
           /* ignore */
         }
-      }, 50);
+      }, 30);
       pollIntervalRef.current = iv;
       return () => clearInterval(iv);
     }
@@ -919,43 +925,62 @@ export default function App() {
       // Apply dynamic ball radius
       gs.ball.radius = dynBallRadius;
 
-      // Guest: just render, no physics
+      // Guest: dead-reckoning prediction + server correction
       if (m === "online-guest") {
-        // Interpolate ball position between prev and current state for smooth rendering
-        const prevGs = prevGsRef.current;
-        interpTRef.current = Math.min(1, interpTRef.current + 0.18);
-        let renderGs = gs;
-        if (prevGs) {
-          const t = interpTRef.current;
-          renderGs = {
-            ...gs,
-            ball: {
-              ...gs.ball,
-              pos: {
-                x: prevGs.ball.pos.x + (gs.ball.pos.x - prevGs.ball.pos.x) * t,
-                y: prevGs.ball.pos.y + (gs.ball.pos.y - prevGs.ball.pos.y) * t,
-              },
-            },
-          };
+        const pred = predGsRef.current;
+        const auth = gsRef.current;
+
+        // Advance ball prediction using last known velocity
+        pred.ball.pos.x += pred.ball.vel.x;
+        pred.ball.pos.y += pred.ball.vel.y;
+        pred.ball.vel.y += GRAVITY;
+        pred.ball.angle = (pred.ball.angle || 0) + pred.ball.spin * 0.05;
+
+        // Bounce ball off ground in prediction
+        if (pred.ball.pos.y + dynBallRadius > GROUND_Y) {
+          pred.ball.pos.y = GROUND_Y - dynBallRadius;
+          pred.ball.vel.y = Math.abs(pred.ball.vel.y) * -0.65;
         }
+        // Bounce off walls
+        if (pred.ball.pos.x - dynBallRadius < 0) {
+          pred.ball.pos.x = dynBallRadius;
+          pred.ball.vel.x = Math.abs(pred.ball.vel.x);
+        }
+        if (pred.ball.pos.x + dynBallRadius > CW) {
+          pred.ball.pos.x = CW - dynBallRadius;
+          pred.ball.vel.x = -Math.abs(pred.ball.vel.x);
+        }
+
+        // Blend toward authoritative ball position (rubber-band correction)
+        const BLEND = 0.12;
+        pred.ball.pos.x += (auth.ball.pos.x - pred.ball.pos.x) * BLEND;
+        pred.ball.pos.y += (auth.ball.pos.y - pred.ball.pos.y) * BLEND;
+
+        // Apply dynamic ball radius
+        pred.ball.radius = dynBallRadius;
+
+        // Build render state: use predicted ball, authoritative players
+        const renderGs: GameState = {
+          ...auth,
+          ball: { ...pred.ball },
+        };
+
         renderFrame(renderGs, m, diff, plt, dynNetH, h);
-        // Cap guest sendInput to every 3 frames
-        guestSendTimerRef.current++;
-        if (guestSendTimerRef.current >= 3) {
-          guestSendTimerRef.current = 0;
-          const inp =
-            plt === "mobile"
-              ? mobileInputRef.current
-              : {
-                  left: keys.has("a") || keys.has("A"),
-                  right: keys.has("d") || keys.has("D"),
-                  jump: keys.has("w") || keys.has("W"),
-                  hit: keys.has(" "),
-                };
-          actorRef.current
-            ?.sendInput(onlineCodeRef.current, JSON.stringify(inp))
-            .catch(() => {});
-        }
+
+        // Send input every frame for maximum responsiveness
+        const inp =
+          plt === "mobile"
+            ? mobileInputRef.current
+            : {
+                left: keys.has("a") || keys.has("A"),
+                right: keys.has("d") || keys.has("D"),
+                jump: keys.has("w") || keys.has("W"),
+                hit: keys.has(" "),
+              };
+        actorRef.current
+          ?.sendInput(onlineCodeRef.current, JSON.stringify(inp))
+          .catch(() => {});
+
         rafRef.current = requestAnimationFrame(frame);
         return;
       }
@@ -1065,13 +1090,9 @@ export default function App() {
       if (gs.celebrating > 0) gs.celebrating--;
 
       if (m === "online-host") {
-        sendStateTimerRef.current++;
-        if (sendStateTimerRef.current >= 3) {
-          sendStateTimerRef.current = 0;
-          actorRef.current
-            ?.sendState(onlineCodeRef.current, JSON.stringify(gs))
-            .catch(() => {});
-        }
+        actorRef.current
+          ?.sendState(onlineCodeRef.current, JSON.stringify(gs))
+          .catch(() => {});
       }
 
       renderFrame(gs, m, diff, plt, dynNetH, h);
@@ -1236,22 +1257,6 @@ export default function App() {
   // ─── Render Helpers ──────────────────────────────────────────────────────
   const btnBase =
     "font-display font-bold rounded-xl border transition-all btn-neon";
-  const year = new Date().getFullYear();
-  const footerLink = `https://caffeine.ai?utm_source=caffeine-footer&utm_medium=referral&utm_content=${encodeURIComponent(window.location.hostname)}`;
-
-  const Footer = () => (
-    <footer className="absolute bottom-4 left-0 right-0 text-center text-white/20 text-xs">
-      © {year}. Built with ❤️ using{" "}
-      <a
-        href={footerLink}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="hover:text-white/40 transition-colors"
-      >
-        caffeine.ai
-      </a>
-    </footer>
-  );
 
   // ─── Hack Toggle Component ───────────────────────────────────────────────
   const HackToggles = () => (
@@ -1347,7 +1352,6 @@ export default function App() {
             </button>
           </div>
         </div>
-        <Footer />
       </div>
     );
   }
@@ -1474,7 +1478,6 @@ export default function App() {
             <span>First to {WIN_SCORE} points wins</span>
           </div>
         </div>
-        <Footer />
       </div>
     );
   }
@@ -1552,7 +1555,6 @@ export default function App() {
             ← Back to Menu
           </button>
         </div>
-        <Footer />
       </div>
     );
   }
@@ -1648,7 +1650,6 @@ export default function App() {
             ← Back to Menu
           </button>
         </div>
-        <Footer />
       </div>
     );
   }
@@ -1766,7 +1767,6 @@ export default function App() {
             ← Back to Menu
           </button>
         </div>
-        <Footer />
       </div>
     );
   }
@@ -1892,7 +1892,6 @@ export default function App() {
             ← Back to Menu
           </button>
         </div>
-        <Footer />
       </div>
     );
   }
@@ -1994,20 +1993,6 @@ export default function App() {
             </button>
           </div>
         )}
-        <div
-          style={{
-            position: "absolute",
-            bottom: 4,
-            left: 0,
-            right: 0,
-            textAlign: "center",
-            color: "rgba(255,255,255,0.12)",
-            fontSize: 11,
-            pointerEvents: "none",
-          }}
-        >
-          © {year}. Built with ❤️ using caffeine.ai
-        </div>
       </div>
     );
   }
@@ -2077,7 +2062,6 @@ export default function App() {
           </button>
         </div>
       </div>
-      <Footer />
     </div>
   );
 }
